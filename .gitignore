@@ -1,4 +1,22 @@
+# Dependencies
 node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Logs
 *.log
+logs/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editor / OS
 .DS_Store
-bun.lock
+.idea/
+.vscode/
+*.swp
