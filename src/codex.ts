@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
 import {
   ClientSideConnection,
@@ -13,6 +14,7 @@ import {
 import type { Config } from "./config.ts";
 import { describePermission, guardianDecision } from "./permissions.ts";
 import { logTurn } from "./log.ts";
+import { resetNonceFile } from "./reset.ts";
 
 /** Grace after an ACP cancel before we hard-stop a wedged turn and respawn. */
 const HARD_STOP_GRACE_MS = 1500;
@@ -126,9 +128,13 @@ export class CodexSession {
   // Generation token: bumped per turn so stale async work (a force-reset turn's
   // background prompt, or a superseded segment) can't mutate a newer turn.
   private turnId = 0;
+  // Last-seen reset nonce; a *change* (the SessionStart hook wrote a new Claude
+  // session id on /clear) drops Codex's context on the next turn.
+  private lastNonce?: string;
 
   constructor(config: Config) {
     this.config = config;
+    this.lastNonce = this.readResetNonce(); // baseline — only a later change resets
   }
 
   private pickOption(options: PermissionOption[], allow: boolean): PermissionOption | undefined {
@@ -390,20 +396,11 @@ export class CodexSession {
 
   /** Start a new prompt turn. Returns Codex's answer or a permission to judge. */
   async ask(prompt: string, opts: AskOptions = {}): Promise<TurnOutcome> {
+    this.checkSessionEpoch(); // a new Claude session (/clear) drops Codex's stale context
     // A prior turn suspended awaiting a decision Claude never made — abandon it.
     // Key on awaitingDecision (the suspended marker), not releaseGate, which is
     // set for every in-flight turn and would wrongly abandon a running one.
-    if (this.awaitingDecision) {
-      this.turnId++; // invalidate the old turn's in-flight async work
-      this.forceReset();
-      this.awaitingDecision = undefined;
-      const waiter = this.eventWaiter;
-      this.eventWaiter = undefined;
-      waiter?.({ kind: "failed", error: new Error("superseded by a new turn") });
-      this.eventQueue = [];
-      this.releaseGate?.();
-      this.releaseGate = undefined;
-    }
+    if (this.awaitingDecision) this.reset();
     await this.acquireGate();
     const id = ++this.turnId;
     this.turnLabel = opts.label ?? "turn";
@@ -429,6 +426,9 @@ export class CodexSession {
 
   /** Resolve the pending permission and resume the suspended turn. */
   async permit(allow: boolean, opts: AskOptions = {}, note?: string): Promise<TurnOutcome> {
+    // If /clear landed between the permission and the decision, reset rather than
+    // resume a stale turn; awaitingDecision is then cleared → NoPendingPermission.
+    this.checkSessionEpoch();
     const permission = this.awaitingDecision;
     if (!permission) throw new NoPendingPermission();
     this.awaitingDecision = undefined;
@@ -524,6 +524,43 @@ export class CodexSession {
       this.finish(id);
       throw err;
     }
+  }
+
+  /** Contents of the per-workspace reset nonce file, or undefined if absent/unreadable. */
+  private readResetNonce(): string | undefined {
+    try {
+      return readFileSync(resetNonceFile(this.config.workspaceRoot), "utf8") || undefined;
+    } catch {
+      return undefined; // missing/unreadable is "no change", never reset churn
+    }
+  }
+
+  /** Reset if the SessionStart hook signalled a new Claude session (/clear). */
+  private checkSessionEpoch(): void {
+    const nonce = this.readResetNonce();
+    if (nonce !== undefined && nonce !== this.lastNonce) {
+      this.lastNonce = nonce;
+      this.reset();
+    }
+  }
+
+  /**
+   * Drop the Codex session and preempt any in-flight or suspended turn, so the
+   * next turn starts a brand-new session. Idempotent and safe with no active
+   * turn. Backs both the manual `reset` tool and auto-reset on a new Claude
+   * session. Must run *before* {@link acquireGate}: a suspended turn deliberately
+   * holds the gate, so waiting on it here would deadlock.
+   */
+  reset(): void {
+    this.turnId++; // invalidate the old turn's in-flight async work
+    this.forceReset();
+    this.awaitingDecision = undefined;
+    const waiter = this.eventWaiter;
+    this.eventWaiter = undefined;
+    waiter?.({ kind: "failed", error: new Error("superseded by session reset") });
+    this.eventQueue = [];
+    this.releaseGate?.();
+    this.releaseGate = undefined;
   }
 
   /** Kill the subprocess and drop the session so the next turn respawns cleanly. */

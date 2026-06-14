@@ -22,6 +22,7 @@ keeps one persistent Codex session per workspace.
 | `explore` | map an unfamiliar codebase (structure, components, flow, conventions) |
 | `reply` | continue the debate — push back on Codex's last answer on the same session |
 | `permit` | allow/deny a permission Codex raised mid-turn, then resume it |
+| `reset` | drop Codex's accumulated context and start a fresh session |
 | `status` | report health: workspace, guardian flags, session liveness, pending permission |
 
 All tools are **advisory** — Codex answers, you decide.
@@ -61,6 +62,27 @@ Claude Code, `MCP_TOOL_TIMEOUT` (e.g. `300000`).
 The tool result stays focused on Codex's answer plus a one-line footer (latency,
 tokens); the full play-by-play goes to the debug log.
 
+### Sessions & reset
+
+The server keeps **one persistent Codex session per workspace** so Codex
+accumulates context across calls (a collaborator, not a stateless oracle). That
+context outlives a Claude `/clear` — the MCP server isn't restarted then — so
+without help the next conversation would land on a Codex that still remembers the
+last one. Two ways to clear it:
+
+- **Automatic, on `/clear`** — install the `SessionStart` hook below. It writes
+  the new Claude session id to a per-workspace nonce file; the server notices the
+  change on its next turn and drops Codex's session, so Codex starts fresh
+  alongside Claude. (`compact`/`resume`/`startup` are intentionally left alone.)
+- **Manual** — call the `reset` tool any time: switching to an unrelated task,
+  when Codex's context has grown stale over a long session, or to clear a wedged
+  turn. It's also the fallback if the hook isn't installed.
+
+Note the asymmetry: Codex's context lives only as long as the server process, but
+Claude's is persisted. After a Claude **resume**, a crash-respawn, or a reboot,
+Codex starts empty while Claude remembers — so a `reply` may land on a Codex that
+no longer has the thread. Re-establish context (or `reset` and start clean) if so.
+
 ## Requirements
 
 - [Bun](https://bun.sh)
@@ -90,6 +112,31 @@ Or in `.mcp.json`:
   }
 }
 ```
+
+### Reset Codex on `/clear` (recommended)
+
+Add a `SessionStart` hook so clearing the Claude conversation also clears Codex's
+context (see [Sessions & reset](#sessions--reset)). In `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bun run /ABS/PATH/codex-fusion-mcp/hooks/session-reset.ts" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook runs on every session start but only acts on `source == "clear"`; for
+other sources it's a no-op. It keys the nonce file on the hook's `cwd`, which must
+match the server's workspace (the default — `CODEX_FUSION_WORKSPACE` unset). Two
+Claude windows in the **same** workspace share the nonce, so a `/clear` in one
+resets Codex for both; that only discards advisory context, never corrupts it.
 
 ## Configuration (env)
 
@@ -128,7 +175,9 @@ src/config.ts       env → Config (guardian flags, turn timeout, debug log)
 src/permissions.ts  guardianDecision — the pure permission policy
 src/prompts.ts      block-structured prompt per tool (+ debate frame)
 src/codex.ts        ACP client: spawn codex-acp, persistent session, streaming ask()
+src/reset.ts        per-workspace reset-nonce path (shared by server + hook)
 src/log.ts          per-turn debug log (stderr summary + optional JSONL file)
 src/index.ts        MCP server: the tools, streaming + cancellation wiring
+hooks/session-reset.ts  SessionStart hook: reset Codex on Claude /clear
 docs/adr/0001-*.md  design decisions
 ```

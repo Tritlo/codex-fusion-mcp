@@ -214,6 +214,26 @@ server.registerTool(
 );
 
 server.registerTool(
+  "reset",
+  {
+    description:
+      "Drop Codex's accumulated session context and start fresh. Use when switching to an unrelated task, when Codex seems confused or its context has grown stale over a long session, or to clear a turn wedged awaiting a permit. The next consult/review/etc. spins up a brand-new Codex session with no prior memory of the conversation. (On /clear this happens automatically if the SessionStart hook is installed — see the README.)",
+    inputSchema: {},
+  },
+  () => {
+    codex.reset();
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: "Codex session reset — the next call starts a fresh session with no prior context.",
+        },
+      ],
+    };
+  },
+);
+
+server.registerTool(
   "status",
   {
     description:
