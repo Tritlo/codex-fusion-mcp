@@ -5,7 +5,14 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { loadConfig } from "./config.ts";
-import { CodexSession, type AskOptions, type AskResult, type SessionStatus, type TurnOutcome } from "./codex.ts";
+import {
+  CodexSession,
+  NoPendingPermission,
+  type AskOptions,
+  type AskResult,
+  type SessionStatus,
+  type TurnOutcome,
+} from "./codex.ts";
 import {
   brainstormPrompt,
   consultPrompt,
@@ -184,16 +191,21 @@ server.registerTool(
     codex
       .permit(decision === "allow", { label: "permit", signal: extra.signal, ...streamHooks(extra) }, note)
       .then(renderOutcome)
-      .catch(
-        (err: unknown): ToolResult => ({
-          content: [
-            {
-              type: "text",
-              text: `No pending permission to resolve (${(err as Error).message}). It may have already completed or been superseded by a newer request.`,
-            },
-          ],
-        }),
-      ),
+      .catch((err: unknown): ToolResult => {
+        // Only swallow the "nothing to resolve" case; a failure inside the
+        // resumed turn must surface, not be masked as a missing permission.
+        if (err instanceof NoPendingPermission) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "No pending permission to resolve — it may have already completed or been superseded by a newer request.",
+              },
+            ],
+          };
+        }
+        throw err;
+      }),
 );
 
 server.registerTool(

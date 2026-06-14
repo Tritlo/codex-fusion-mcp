@@ -17,6 +17,14 @@ import { logTurn } from "./log.ts";
 /** Grace after an ACP cancel before we hard-stop a wedged turn and respawn. */
 const HARD_STOP_GRACE_MS = 1500;
 
+/** Thrown by {@link CodexSession.permit} when no turn is awaiting a decision. */
+export class NoPendingPermission extends Error {
+  constructor() {
+    super("no pending permission to decide");
+    this.name = "NoPendingPermission";
+  }
+}
+
 /** The outcome of one Codex prompt turn. */
 export interface AskResult {
   /** Codex's assembled final message. */
@@ -111,6 +119,9 @@ export class CodexSession {
   // Serializes turns; the holder releases it when the turn fully ends.
   private turnGate: Promise<void> = Promise.resolve();
   private releaseGate?: () => void;
+  // Generation token: bumped per turn so stale async work (a force-reset turn's
+  // background prompt, or a superseded segment) can't mutate a newer turn.
+  private turnId = 0;
 
   constructor(config: Config) {
     this.config = config;
@@ -249,28 +260,39 @@ export class CodexSession {
     }
   }
 
-  /** Start the session, but give up (killing a wedged startup) if `signal` aborts. */
+  /**
+   * Start the session, giving up if `signal` aborts or startup exceeds the turn
+   * timeout (a wedged `initialize`/`newSession` must not pin the gate). Returns
+   * false if cancelled; throws on startup failure or timeout.
+   */
   private async ensureStartedAbortable(signal?: AbortSignal): Promise<boolean> {
     if (this.sessionId) return true;
     if (signal?.aborted) return false;
     const startup = this.ensureStarted();
-    if (!signal) {
-      await startup;
-      return true;
-    }
+    startup.catch(() => {}); // we may stop awaiting it below; don't leak a rejection
     return await new Promise<boolean>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        this.forceReset();
+        reject(new Error(`codex-acp startup timed out after ${this.config.turnTimeoutMs}ms`));
+      }, this.config.turnTimeoutMs);
       const onAbort = (): void => {
+        cleanup();
         this.forceReset(); // kill a wedged/half-started child so it can't pin the queue
         resolve(false);
       };
-      signal.addEventListener("abort", onAbort, { once: true });
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
       startup.then(
         () => {
-          signal.removeEventListener("abort", onAbort);
+          cleanup();
           resolve(true);
         },
         (err) => {
-          signal.removeEventListener("abort", onAbort);
+          cleanup();
           reject(err);
         },
       );
@@ -307,7 +329,9 @@ export class CodexSession {
     this.releaseGate = release;
   }
 
-  private endTurn(): void {
+  /** End turn `id`, releasing the gate and clearing state — a no-op if superseded. */
+  private finish(id: number): void {
+    if (id !== this.turnId) return; // a newer turn owns the state now; don't touch it
     this.awaitingDecision = undefined;
     this.eventQueue = [];
     this.eventWaiter = undefined;
@@ -336,21 +360,35 @@ export class CodexSession {
     return result;
   }
 
-  private launchTurn(prompt: string): void {
+  private launchTurn(prompt: string, id: number): void {
     this.conn!.prompt({ sessionId: this.sessionId!, prompt: [{ type: "text", text: prompt }] }).then(
-      (res) => this.pushEvent({ kind: "done", result: this.snapshot(res.stopReason, res.usage ?? undefined) }),
-      (err) => this.pushEvent({ kind: "failed", error: err as Error }),
+      (res) => {
+        if (id !== this.turnId) return; // stale completion from a superseded turn
+        this.pushEvent({ kind: "done", result: this.snapshot(res.stopReason, res.usage ?? undefined) });
+      },
+      (err) => {
+        if (id !== this.turnId) return;
+        this.pushEvent({ kind: "failed", error: err as Error });
+      },
     );
   }
 
   /** Start a new prompt turn. Returns Codex's answer or a permission to judge. */
   async ask(prompt: string, opts: AskOptions = {}): Promise<TurnOutcome> {
     // A prior turn suspended awaiting a decision Claude never made — abandon it.
-    if (this.releaseGate) {
+    if (this.awaitingDecision || this.releaseGate) {
+      this.turnId++; // invalidate the old turn's in-flight async work
       this.forceReset();
-      this.endTurn();
+      this.awaitingDecision = undefined;
+      const waiter = this.eventWaiter;
+      this.eventWaiter = undefined;
+      waiter?.({ kind: "failed", error: new Error("superseded by a new turn") });
+      this.eventQueue = [];
+      this.releaseGate?.();
+      this.releaseGate = undefined;
     }
     await this.acquireGate();
+    const id = ++this.turnId;
     this.turnLabel = opts.label ?? "turn";
     this.turnText = "";
     this.turnLog = [];
@@ -361,35 +399,36 @@ export class CodexSession {
       const ok = await this.ensureStartedAbortable(opts.signal);
       if (!ok) {
         const result = this.snapshot("cancelled");
-        this.endTurn();
+        this.finish(id);
         return { type: "answer", result };
       }
     } catch (err) {
-      this.endTurn();
+      this.finish(id);
       throw err;
     }
-    this.launchTurn(prompt);
-    return this.drive(opts);
+    this.launchTurn(prompt, id);
+    return this.drive(opts, id);
   }
 
   /** Resolve the pending permission and resume the suspended turn. */
   async permit(allow: boolean, opts: AskOptions = {}, note?: string): Promise<TurnOutcome> {
     const permission = this.awaitingDecision;
-    if (!permission) throw new Error("no pending permission to decide");
+    if (!permission) throw new NoPendingPermission();
     this.awaitingDecision = undefined;
     this.turnLog.push(`${allow ? "allowed" : "denied"} by claude${note ? `: ${note}` : ""}`);
     permission.decide(allow);
-    return this.drive(opts);
+    return this.drive(opts, this.turnId); // same generation as the suspended turn
   }
 
-  /** Wait for the next turn event, applying streaming, cancel, and timeout. */
-  private async drive(opts: AskOptions): Promise<TurnOutcome> {
+  /** Wait for turn `id`'s next event, applying streaming, cancel, and timeout. */
+  private async drive(opts: AskOptions, id: number): Promise<TurnOutcome> {
     this.turnOnText = opts.onText;
     this.turnOnActivity = opts.onActivity;
 
     const ctrl = new AbortController();
     const onExternalAbort = (): void => ctrl.abort();
     opts.signal?.addEventListener("abort", onExternalAbort, { once: true });
+    if (opts.signal?.aborted) ctrl.abort(); // listener won't fire for an already-aborted signal
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
@@ -401,8 +440,8 @@ export class CodexSession {
     let hardStop = false;
     const abandoned = new Promise<never>((_, reject) => {
       const arm = (): void => {
-        const id = this.sessionId;
-        if (id) this.conn?.cancel({ sessionId: id }).catch(() => {});
+        const sid = this.sessionId;
+        if (sid) this.conn?.cancel({ sessionId: sid }).catch(() => {});
         setTimeout(() => {
           hardStop = true;
           reject(new Error("hard stop after cancel grace"));
@@ -415,12 +454,26 @@ export class CodexSession {
     const clearSegment = (): void => {
       clearTimeout(timer);
       opts.signal?.removeEventListener("abort", onExternalAbort);
-      this.turnOnText = undefined;
-      this.turnOnActivity = undefined;
+      if (id === this.turnId) {
+        this.turnOnText = undefined;
+        this.turnOnActivity = undefined;
+      }
+    };
+
+    const cancelledAnswer = (): TurnOutcome => {
+      const result = this.snapshot(timedOut ? "timeout" : "cancelled");
+      clearSegment();
+      this.finish(id);
+      return { type: "answer", result };
     };
 
     try {
       const event = await Promise.race([this.nextEvent(), abandoned]);
+      if (id !== this.turnId) {
+        // This segment was superseded; don't touch the newer turn's state.
+        clearSegment();
+        return { type: "answer", result: { text: "", stopReason: "cancelled", log: [], ms: 0 } };
+      }
       if (event.kind === "permission") {
         // Suspend: keep the turn open; the wait for Claude's decision isn't timed.
         this.awaitingDecision = event.permission;
@@ -428,28 +481,25 @@ export class CodexSession {
         return { type: "permission", description: event.permission.description };
       }
       if (event.kind === "failed") {
+        if (ctrl.signal.aborted) return cancelledAnswer();
         clearSegment();
-        if (ctrl.signal.aborted) {
-          const result = this.snapshot(timedOut ? "timeout" : "cancelled");
-          this.endTurn();
-          return { type: "answer", result };
-        }
-        this.endTurn();
+        this.finish(id);
         throw event.error;
       }
       clearSegment();
-      this.endTurn();
+      this.finish(id);
       return { type: "answer", result: event.result };
     } catch (err) {
       if (hardStop || ctrl.signal.aborted) {
+        if (id !== this.turnId) {
+          clearSegment();
+          return { type: "answer", result: { text: "", stopReason: "cancelled", log: [], ms: 0 } };
+        }
         if (hardStop) this.forceReset();
-        const result = this.snapshot(timedOut ? "timeout" : "cancelled");
-        clearSegment();
-        this.endTurn();
-        return { type: "answer", result };
+        return cancelledAnswer();
       }
       clearSegment();
-      this.endTurn();
+      this.finish(id);
       throw err;
     }
   }
