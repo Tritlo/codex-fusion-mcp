@@ -87,11 +87,20 @@ Or in `.mcp.json`:
 ### Guardian mode
 
 By default the server runs in **guardian mode**: Codex may only *read inside the
-workspace*. Writes, command execution, network fetches, and reads that escape
-the workspace root are refused automatically, and each decision is reported back
-to Claude in the tool result (so you can see what Codex wanted). Flip the
-`ALLOW_*` flags to widen one category at a time. The policy lives in
-[`src/permissions.ts`](src/permissions.ts) as a single pure function.
+workspace*. Writes, network fetches, and reads that escape the workspace root are
+refused automatically, and each decision is reported back to Claude (in the debug
+log). Flip the `ALLOW_*` flags to widen one category at a time. The policy lives
+in [`src/permissions.ts`](src/permissions.ts) as a single pure function.
+
+**Read-only commands are allowed by default** so review tools work without
+opening the command floodgates: Codex may run a single read-only invocation —
+git read subcommands (`diff`, `status`, `log`, `show`, `blame`, …) and tools like
+`cat`/`ls`/`rg`/`grep`/`head`/`wc` — but anything that chains, substitutes, or
+redirects (`;`, `|`, `&`, `` ` ``, `$(`, `>`) is refused, as is any non-read-only
+program. Commands are held to the *same* workspace boundary as the read tool:
+path arguments that escape the root (absolute outside, `..`, `~`) are blocked
+unless `ALLOW_EXTERNAL_READS` is set. `ALLOW_COMMANDS` still removes the
+allowlist entirely and permits any command.
 
 ## Layout
 

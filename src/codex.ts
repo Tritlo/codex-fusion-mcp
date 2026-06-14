@@ -13,6 +13,9 @@ import type { Config } from "./config.ts";
 import { guardianDecision } from "./permissions.ts";
 import { logTurn } from "./log.ts";
 
+/** Grace after an ACP cancel before we hard-stop a wedged turn and respawn. */
+const HARD_STOP_GRACE_MS = 1500;
+
 /** The outcome of one Codex prompt turn. */
 export interface AskResult {
   /** Codex's assembled final message. */
@@ -153,6 +156,13 @@ export class CodexSession {
       this.sessionId = session.sessionId;
     } catch (err) {
       const tail = this.stderr.join("").trim().slice(-600);
+      // Don't leak the half-started subprocess; reset so the next call respawns.
+      if (this.child === child) {
+        this.child = undefined;
+        this.conn = undefined;
+        this.sessionId = undefined;
+      }
+      child.kill();
       throw new Error(
         `codex-acp failed to start a session: ${(err as Error).message}` +
           (tail ? `\n\ncodex-acp stderr:\n${tail}` : "") +
@@ -183,15 +193,22 @@ export class CodexSession {
   }
 
   private async runTurn(prompt: string, opts: AskOptions): Promise<AskResult> {
+    const logCancel = (): AskResult => {
+      logTurn(this.config, { tool: opts.label ?? "turn", ms: 0, stopReason: "cancelled", activity: [], text: "" });
+      return { text: "", stopReason: "cancelled", log: [], ms: 0 };
+    };
+    // Honour a cancel that arrived while this turn waited in the queue or during startup.
+    if (opts.signal?.aborted) return logCancel();
     await this.ensureStarted();
+    if (opts.signal?.aborted) return logCancel();
+
     this.turnText = "";
     this.turnLog = [];
     this.turnOnText = opts.onText;
     this.turnOnActivity = opts.onActivity;
     const started = Date.now();
 
-    // One controller fires on either the caller's cancel or our turn timeout;
-    // either way we tell codex-acp to stop the turn.
+    // One controller fires on either the caller's cancel or our turn timeout.
     const ctrl = new AbortController();
     const onExternalAbort = () => ctrl.abort();
     opts.signal?.addEventListener("abort", onExternalAbort, { once: true });
@@ -200,43 +217,57 @@ export class CodexSession {
       timedOut = true;
       ctrl.abort();
     }, this.config.turnTimeoutMs);
-    ctrl.signal.addEventListener(
-      "abort",
-      () => {
+
+    // On abort we ask codex-acp to cancel, then arm a hard stop: ACP cancel is
+    // only a notification, so a wedged or cancel-ignoring agent could otherwise
+    // keep `prompt()` (and the serialized queue) pending forever.
+    let hardStop = false;
+    const abandoned = new Promise<never>((_, reject) => {
+      const arm = (): void => {
         const id = this.sessionId;
         if (id) this.conn?.cancel({ sessionId: id }).catch(() => {});
-      },
-      { once: true },
-    );
+        setTimeout(() => {
+          hardStop = true;
+          reject(new Error("hard stop after cancel grace"));
+        }, HARD_STOP_GRACE_MS);
+      };
+      if (ctrl.signal.aborted) arm();
+      else ctrl.signal.addEventListener("abort", arm, { once: true });
+    });
 
-    const finish = (stopReason: string): AskResult => {
+    const finish = (stopReason: string, usage?: Usage): AskResult => {
       const result: AskResult = {
         text: this.turnText.trim(),
         stopReason,
         log: [...this.turnLog],
         ms: Date.now() - started,
+        usage,
       };
       logTurn(this.config, {
         tool: opts.label ?? "turn",
         ms: result.ms,
         stopReason,
-        totalTokens: result.usage?.totalTokens,
+        totalTokens: usage?.totalTokens,
         activity: result.log,
         text: result.text,
       });
       return result;
     };
 
+    const pending = this.conn!.prompt({
+      sessionId: this.sessionId!,
+      prompt: [{ type: "text", text: prompt }],
+    });
     try {
-      const res = await this.conn!.prompt({
-        sessionId: this.sessionId!,
-        prompt: [{ type: "text", text: prompt }],
-      });
-      const result = finish(timedOut ? "timeout" : res.stopReason);
-      result.usage = res.usage ?? undefined;
-      return result;
+      const res = await Promise.race([pending, abandoned]);
+      return finish(timedOut ? "timeout" : res.stopReason, res.usage ?? undefined);
     } catch (err) {
-      // A cancel/timeout often surfaces as a rejected prompt; report it gracefully.
+      if (hardStop) {
+        pending.catch(() => {}); // the abandoned prompt may settle later — swallow it
+        this.forceReset(); // agent state is now unknown; respawn on the next turn
+        return finish(timedOut ? "timeout" : "cancelled");
+      }
+      // A clean cancel often surfaces as a rejected prompt; report it gracefully.
       if (ctrl.signal.aborted) return finish(timedOut ? "timeout" : "cancelled");
       throw err;
     } finally {
@@ -245,6 +276,16 @@ export class CodexSession {
       this.turnOnText = undefined;
       this.turnOnActivity = undefined;
     }
+  }
+
+  /** Kill the subprocess and drop the session so the next turn respawns cleanly. */
+  private forceReset(): void {
+    const child = this.child;
+    this.child = undefined;
+    this.conn = undefined;
+    this.sessionId = undefined;
+    this.starting = undefined;
+    child?.kill();
   }
 
   /** Current health, without starting a session. */

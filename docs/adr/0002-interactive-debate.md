@@ -30,8 +30,21 @@ single-persistent-session model.
   stderr summary always, and full JSONL to `CODEX_FUSION_LOG` when set.
 - **Robustness.** `ensureStarted` clears the `starting` promise on failure so a
   fixed login recovers without a restart; a `child.on("exit")` handler resets the
-  session so the next call respawns; token usage from `PromptResponse.usage` is
-  surfaced in the footer.
+  session so the next call respawns; a failed startup kills its half-spawned
+  child instead of leaking it; token usage from `PromptResponse.usage` is
+  surfaced in the footer. Cancel/timeout is a *hard* stop: ACP `session/cancel`
+  is only a notification, so after a short grace the turn is abandoned and the
+  subprocess force-reset — a wedged or cancel-ignoring agent can't pin the
+  serialized queue. A cancel that arrives while a turn is still queued is honored
+  before any prompt is sent.
+- **Read-only commands under guardian.** Review genuinely needs `git diff` and
+  friends, but `git` is an `execute` tool call, which guardian blocked. Rather
+  than force the all-or-nothing `ALLOW_COMMANDS`, guardian now allows a single
+  read-only invocation by default — git read subcommands and `cat`/`ls`/`rg`/…
+  — rejecting shell chaining/substitution/redirection and any non-read-only
+  program. Command path arguments honor the same workspace boundary as the read
+  tool (escapes need `ALLOW_EXTERNAL_READS`), so the "reads stay inside the
+  workspace" promise still holds across both channels.
 - **New tools.** `reply` (continue the debate) and `status` (read-only health:
   workspace, guardian flags, session/subprocess liveness, recent stderr).
 
