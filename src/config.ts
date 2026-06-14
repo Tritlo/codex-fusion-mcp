@@ -19,11 +19,20 @@ export interface Config {
   allowWrites: boolean;
   /** Expansion: let Codex run shell commands. */
   allowCommands: boolean;
+  /** Abort a single Codex turn after this many ms (frees the serialized queue). */
+  turnTimeoutMs: number;
+  /** Optional path to append a full per-turn JSONL debug log to. */
+  logFile?: string;
 }
 
 function envBool(name: string): boolean {
   const v = process.env[name]?.toLowerCase();
   return v === "1" || v === "true" || v === "yes";
+}
+
+function envInt(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
 /** Build the {@link Config} from environment variables. */
@@ -37,5 +46,7 @@ export function loadConfig(): Config {
     allowExternalReads: envBool("CODEX_FUSION_ALLOW_EXTERNAL_READS"),
     allowWrites: envBool("CODEX_FUSION_ALLOW_WRITES"),
     allowCommands: envBool("CODEX_FUSION_ALLOW_COMMANDS"),
+    turnTimeoutMs: envInt("CODEX_FUSION_TURN_TIMEOUT_MS", 120_000),
+    logFile: process.env.CODEX_FUSION_LOG?.trim() || undefined,
   };
 }
