@@ -20,8 +20,27 @@ keeps one persistent Codex session per workspace.
 | `review_diff` | have Codex review code changes (pass a diff, or let it read `git diff`) |
 | `brainstorm` | get 2–4 alternative approaches with trade-offs + a recommendation |
 | `explore` | map an unfamiliar codebase (structure, components, flow, conventions) |
+| `reply` | continue the debate — push back on Codex's last answer on the same session |
+| `status` | report health: workspace, guardian flags, whether Codex is alive |
 
 All tools are **advisory** — Codex answers, you decide.
+
+### Debate, not one-shot
+
+The deliberative tools (`consult`, `review_plan`, `review_diff`, `brainstorm`)
+frame each exchange as a short debate: Codex pushes back, and ends every reply
+with a `VERDICT: CONSENSUS — …` or `VERDICT: OPEN — …` line. When it's `OPEN`,
+push back with `reply` (same persistent session, so Codex keeps the thread) and
+drive toward consensus — keep it to ~3 turns.
+
+### Streaming & cancellation
+
+Turns stream live: Codex's text and a `↳ reading …` activity trail are sent as
+MCP progress notifications, so you can watch (and steer between turns). Cancel a
+turn and Codex is told to stop (`session/cancel`). A turn that runs past
+`CODEX_FUSION_TURN_TIMEOUT_MS` is aborted so it can't wedge the queue. The tool
+result stays focused on Codex's answer plus a one-line footer (latency, tokens,
+and any blocked actions); the full play-by-play goes to the debug log.
 
 ## Requirements
 
@@ -62,6 +81,8 @@ Or in `.mcp.json`:
 | `CODEX_FUSION_ALLOW_EXTERNAL_READS` | off | Let Codex read outside the workspace + use network fetch. |
 | `CODEX_FUSION_ALLOW_WRITES` | off | Let Codex edit/delete/move files inside the workspace. |
 | `CODEX_FUSION_ALLOW_COMMANDS` | off | Let Codex run shell commands. |
+| `CODEX_FUSION_TURN_TIMEOUT_MS` | `120000` | Abort a single Codex turn after this long. |
+| `CODEX_FUSION_LOG` | off | Append a full per-turn JSONL debug log to this path. |
 
 ### Guardian mode
 
@@ -75,10 +96,11 @@ to Claude in the tool result (so you can see what Codex wanted). Flip the
 ## Layout
 
 ```
-src/config.ts       env → Config (incl. guardian flags)
+src/config.ts       env → Config (guardian flags, turn timeout, debug log)
 src/permissions.ts  guardianDecision — the pure permission policy
-src/prompts.ts      block-structured prompt per tool
-src/codex.ts        ACP client: spawn codex-acp, persistent session, ask()
-src/index.ts        MCP server: the five tools
+src/prompts.ts      block-structured prompt per tool (+ debate frame)
+src/codex.ts        ACP client: spawn codex-acp, persistent session, streaming ask()
+src/log.ts          per-turn debug log (stderr summary + optional JSONL file)
+src/index.ts        MCP server: the tools, streaming + cancellation wiring
 docs/adr/0001-*.md  design decisions
 ```
