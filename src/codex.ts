@@ -47,6 +47,9 @@ export interface AskOptions {
   signal?: AbortSignal;
   /** Called with each chunk of Codex's reply as it streams in. */
   onText?: (chunk: string) => void;
+  /** Called with each chunk of Codex's reasoning, for a live "thinking" view. Also
+   * the heartbeat that keeps the MCP request alive during long silent reasoning. */
+  onThought?: (chunk: string) => void;
   /** Called with each guardian decision / tool call, for a live activity view. */
   onActivity?: (note: string) => void;
 }
@@ -109,6 +112,7 @@ export class CodexSession {
   private turnStart = 0;
   private turnLabel = "turn";
   private turnOnText?: (chunk: string) => void;
+  private turnOnThought?: (chunk: string) => void;
   private turnOnActivity?: (note: string) => void;
 
   // Event channel between the ACP callbacks and ask()/permit().
@@ -178,6 +182,13 @@ export class CodexSession {
               this.turnText += u.content.text;
               this.turnOnText?.(u.content.text);
             }
+            break;
+          case "agent_thought_chunk":
+            // Codex's reasoning. Forward only as a live view / heartbeat — emitting
+            // progress keeps the MCP request alive through long silent thinking
+            // (the client resets its timeout on progress). Never fold it into
+            // turnText, which must stay Codex's final answer.
+            if (u.content.type === "text") this.turnOnThought?.(u.content.text);
             break;
           case "tool_call": {
             const note = `tool: ${u.title ?? u.kind ?? u.toolCallId}`;
@@ -339,6 +350,7 @@ export class CodexSession {
     this.eventQueue = [];
     this.eventWaiter = undefined;
     this.turnOnText = undefined;
+    this.turnOnThought = undefined;
     this.turnOnActivity = undefined;
     this.releaseGate?.();
     this.releaseGate = undefined;
@@ -431,6 +443,7 @@ export class CodexSession {
   /** Wait for turn `id`'s next event, applying streaming, cancel, and timeout. */
   private async drive(opts: AskOptions, id: number): Promise<TurnOutcome> {
     this.turnOnText = opts.onText;
+    this.turnOnThought = opts.onThought;
     this.turnOnActivity = opts.onActivity;
 
     const ctrl = new AbortController();
@@ -464,6 +477,7 @@ export class CodexSession {
       opts.signal?.removeEventListener("abort", onExternalAbort);
       if (id === this.turnId) {
         this.turnOnText = undefined;
+        this.turnOnThought = undefined;
         this.turnOnActivity = undefined;
       }
     };

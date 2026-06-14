@@ -69,10 +69,11 @@ function renderOutcome(outcome: TurnOutcome): ToolResult {
 const tail = (s: string): string => s.replace(/\s+/g, " ").trim().slice(-140);
 
 /** Streaming hooks that forward Codex's output to the client as progress. */
-function streamHooks(extra: Extra): Pick<AskOptions, "onText" | "onActivity"> {
+function streamHooks(extra: Extra): Pick<AskOptions, "onText" | "onThought" | "onActivity"> {
   const token = extra._meta?.progressToken;
   let progress = 0;
   let acc = "";
+  let thinking = "";
   const notify = (message: string): void => {
     if (token === undefined) return;
     void extra.sendNotification({
@@ -84,6 +85,10 @@ function streamHooks(extra: Extra): Pick<AskOptions, "onText" | "onActivity"> {
     onText: (chunk) => {
       acc += chunk;
       notify(tail(acc));
+    },
+    onThought: (chunk) => {
+      thinking += chunk;
+      notify(`💭 ${tail(thinking)}`);
     },
     onActivity: (note) => notify(`↳ ${note}`),
   };

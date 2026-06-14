@@ -47,12 +47,17 @@ commands, writes, network, out-of-workspace reads — comes back to Claude. The
 
 ### Streaming & cancellation
 
-Turns stream live: Codex's text and a `↳ …` activity trail are sent as MCP
-progress notifications, so you can watch (and steer between turns). Cancel a turn
-and Codex is told to stop (`session/cancel`); if it ignores the cancel, a short
-grace later the turn is hard-stopped and the subprocess respawned, so it can't
-wedge the queue. A turn that runs past `CODEX_FUSION_TURN_TIMEOUT_MS` of active
-work is aborted the same way (the wait for a `permit` decision is **not** timed).
+Turns stream live: Codex's text, its reasoning (a `💭 …` thinking view), and a
+`↳ …` activity trail are sent as MCP progress notifications, so you can watch
+(and steer between turns). The reasoning stream doubles as a heartbeat — the MCP
+client resets its request timeout on progress, so forwarding Codex's thinking
+keeps a long, silently-reasoning turn from being cancelled by the client. Cancel
+a turn and Codex is told to stop (`session/cancel`); if it ignores the cancel, a
+short grace later the turn is hard-stopped and the subprocess respawned, so it
+can't wedge the queue. A turn that runs past `CODEX_FUSION_TURN_TIMEOUT_MS` of
+active work is aborted the same way (the wait for a `permit` decision is **not**
+timed). If your client caps tool calls more tightly, raise its timeout too — for
+Claude Code, `MCP_TOOL_TIMEOUT` (e.g. `300000`).
 The tool result stays focused on Codex's answer plus a one-line footer (latency,
 tokens); the full play-by-play goes to the debug log.
 
@@ -95,7 +100,7 @@ Or in `.mcp.json`:
 | `CODEX_FUSION_ALLOW_EXTERNAL_READS` | off | Let Codex read outside the workspace + use network fetch. |
 | `CODEX_FUSION_ALLOW_WRITES` | off | Let Codex edit/delete/move files inside the workspace. |
 | `CODEX_FUSION_ALLOW_COMMANDS` | off | Let Codex run shell commands. |
-| `CODEX_FUSION_TURN_TIMEOUT_MS` | `120000` | Abort a single Codex turn after this long. |
+| `CODEX_FUSION_TURN_TIMEOUT_MS` | `300000` | Abort a single Codex turn after this long of active work. |
 | `CODEX_FUSION_LOG` | off | Append a full per-turn JSONL debug log to this path. |
 
 ### Guardian mode

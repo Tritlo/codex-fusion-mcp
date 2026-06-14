@@ -46,7 +46,7 @@ export function loadConfig(): Config {
     allowExternalReads: envBool("CODEX_FUSION_ALLOW_EXTERNAL_READS"),
     allowWrites: envBool("CODEX_FUSION_ALLOW_WRITES"),
     allowCommands: envBool("CODEX_FUSION_ALLOW_COMMANDS"),
-    turnTimeoutMs: envInt("CODEX_FUSION_TURN_TIMEOUT_MS", 120_000),
+    turnTimeoutMs: envInt("CODEX_FUSION_TURN_TIMEOUT_MS", 300_000),
     logFile: process.env.CODEX_FUSION_LOG?.trim() || undefined,
   };
 }
