@@ -5,12 +5,13 @@ import {
   ndJsonStream,
   PROTOCOL_VERSION,
   type Client,
+  type PermissionOption,
   type RequestPermissionResponse,
   type SessionNotification,
   type Usage,
 } from "@agentclientprotocol/sdk";
 import type { Config } from "./config.ts";
-import { guardianDecision } from "./permissions.ts";
+import { describePermission, guardianDecision } from "./permissions.ts";
 import { logTurn } from "./log.ts";
 
 /** Grace after an ACP cancel before we hard-stop a wedged turn and respawn. */
@@ -42,6 +43,28 @@ export interface AskOptions {
   onActivity?: (note: string) => void;
 }
 
+/** A permission Codex raised mid-turn, awaiting Claude's allow/deny. */
+interface PendingPermission {
+  /** What Codex wants to do, for Claude to judge. */
+  description: string;
+  /** Resolve the held-open ACP request with Claude's decision. */
+  decide: (allow: boolean) => void;
+}
+
+/**
+ * What {@link CodexSession.ask}/{@link CodexSession.permit} return: either
+ * Codex's answer, or a permission request handed back for Claude to judge.
+ */
+export type TurnOutcome =
+  | { type: "answer"; result: AskResult }
+  | { type: "permission"; description: string };
+
+/** Internal: the next thing that happens in a running turn. */
+type TurnEvent =
+  | { kind: "permission"; permission: PendingPermission }
+  | { kind: "done"; result: AskResult }
+  | { kind: "failed"; error: Error };
+
 /** A point-in-time health snapshot of the Codex session. */
 export interface SessionStatus {
   workspaceRoot: string;
@@ -49,16 +72,20 @@ export interface SessionStatus {
   guardian: { externalReads: boolean; writes: boolean; commands: boolean };
   sessionStarted: boolean;
   childAlive: boolean;
+  /** Description of a permission currently awaiting Claude's decision, if any. */
+  pendingPermission?: string;
   stderrTail: string;
 }
 
 /**
  * A long-lived ACP client over a spawned `codex-acp` process.
  *
- * One session is created lazily on first use and reused for every tool call,
- * so Codex accumulates context across the conversation (the "persistent
- * session" fusion model). Prompt turns are serialized: callers await {@link
- * ask}, and turns never interleave on the single session.
+ * One session is created lazily on first use and reused for every tool call, so
+ * Codex accumulates context across the conversation (the "persistent session"
+ * fusion model). Turns are serialized behind a gate. A turn can pause mid-flight
+ * when Codex requests a permission guardian doesn't auto-allow: {@link ask}
+ * returns a {@link TurnOutcome} of `permission`, and {@link permit} resumes the
+ * same suspended turn once Claude has decided.
  */
 export class CodexSession {
   private readonly config: Config;
@@ -66,36 +93,73 @@ export class CodexSession {
   private conn?: ClientSideConnection;
   private sessionId?: string;
   private starting?: Promise<void>;
-  private queue: Promise<unknown> = Promise.resolve();
   private readonly stderr: string[] = [];
 
-  // Accumulators/hooks for the in-flight turn (safe because turns are serialized).
+  // In-flight turn state (safe because turns are serialized behind the gate).
   private turnText = "";
   private turnLog: string[] = [];
+  private turnStart = 0;
+  private turnLabel = "turn";
   private turnOnText?: (chunk: string) => void;
   private turnOnActivity?: (note: string) => void;
+
+  // Event channel between the ACP callbacks and ask()/permit().
+  private eventQueue: TurnEvent[] = [];
+  private eventWaiter?: (e: TurnEvent) => void;
+  private awaitingDecision?: PendingPermission;
+
+  // Serializes turns; the holder releases it when the turn fully ends.
+  private turnGate: Promise<void> = Promise.resolve();
+  private releaseGate?: () => void;
 
   constructor(config: Config) {
     this.config = config;
   }
 
+  private pickOption(options: PermissionOption[], allow: boolean): PermissionOption | undefined {
+    const wanted: Array<PermissionOption["kind"]> = allow
+      ? ["allow_once", "allow_always"]
+      : ["reject_once", "reject_always"];
+    return wanted.map((kind) => options.find((o) => o.kind === kind)).find((o) => o !== undefined);
+  }
+
   private buildClient(): Client {
     return {
       requestPermission: async (params): Promise<RequestPermissionResponse> => {
-        const decision = guardianDecision(params.toolCall, this.config);
-        const label = params.toolCall.title ?? params.toolCall.kind ?? "action";
-        const note = `${decision.allow ? "approved" : "denied"}: ${label} — ${decision.reason}`;
-        this.turnLog.push(note);
-        this.turnOnActivity?.(note);
-        const wanted: Array<"allow_once" | "allow_always" | "reject_once" | "reject_always"> =
-          decision.allow ? ["allow_once", "allow_always"] : ["reject_once", "reject_always"];
-        const option = wanted
-          .map((kind) => params.options.find((o) => o.kind === kind))
-          .find((o) => o !== undefined);
-        if (!option) return { outcome: { outcome: "cancelled" } };
-        return { outcome: { outcome: "selected", optionId: option.optionId } };
+        // Ignore late requests from a superseded session (after a respawn).
+        if (params.sessionId !== this.sessionId) return { outcome: { outcome: "cancelled" } };
+
+        const verdict = guardianDecision(params.toolCall, this.config);
+        const label = describePermission(params.toolCall);
+        if (verdict.decision === "allow") {
+          const note = `auto-allowed: ${label}`;
+          this.turnLog.push(note);
+          this.turnOnActivity?.(note);
+          const option = this.pickOption(params.options, true);
+          return option
+            ? { outcome: { outcome: "selected", optionId: option.optionId } }
+            : { outcome: { outcome: "cancelled" } };
+        }
+
+        // Hand the decision back to Claude; suspend the turn until permit().
+        this.turnOnActivity?.(`needs permission: ${label}`);
+        return await new Promise<RequestPermissionResponse>((resolveAcp) => {
+          const permission: PendingPermission = {
+            description: `${label}${verdict.reason ? `  [${verdict.reason}]` : ""}`,
+            decide: (allow) => {
+              const option = this.pickOption(params.options, allow);
+              resolveAcp(
+                option
+                  ? { outcome: { outcome: "selected", optionId: option.optionId } }
+                  : { outcome: { outcome: "cancelled" } },
+              );
+            },
+          };
+          this.pushEvent({ kind: "permission", permission });
+        });
       },
       sessionUpdate: async (params: SessionNotification): Promise<void> => {
+        if (params.sessionId !== this.sessionId) return; // drop stale-session updates
         const u = params.update;
         switch (u.sessionUpdate) {
           case "agent_message_chunk":
@@ -131,7 +195,7 @@ export class CodexSession {
       this.stderr.push(d.toString());
       if (this.stderr.length > 50) this.stderr.shift();
     });
-    // If codex-acp dies, drop the session so the next ask() respawns it.
+    // If codex-acp dies, drop the session so the next turn respawns it.
     child.on("exit", (code, signal) => {
       this.stderr.push(`codex-acp exited (code=${code} signal=${signal})`);
       if (this.child === child) {
@@ -185,32 +249,146 @@ export class CodexSession {
     }
   }
 
-  /** Send one prompt to Codex and collect its reply. Turns are serialized. */
-  async ask(prompt: string, opts: AskOptions = {}): Promise<AskResult> {
-    const run = this.queue.then(() => this.runTurn(prompt, opts));
-    this.queue = run.catch(() => undefined);
-    return run;
+  /** Start the session, but give up (killing a wedged startup) if `signal` aborts. */
+  private async ensureStartedAbortable(signal?: AbortSignal): Promise<boolean> {
+    if (this.sessionId) return true;
+    if (signal?.aborted) return false;
+    const startup = this.ensureStarted();
+    if (!signal) {
+      await startup;
+      return true;
+    }
+    return await new Promise<boolean>((resolve, reject) => {
+      const onAbort = (): void => {
+        this.forceReset(); // kill a wedged/half-started child so it can't pin the queue
+        resolve(false);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      startup.then(
+        () => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(true);
+        },
+        (err) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(err);
+        },
+      );
+    });
   }
 
-  private async runTurn(prompt: string, opts: AskOptions): Promise<AskResult> {
-    const logCancel = (): AskResult => {
-      logTurn(this.config, { tool: opts.label ?? "turn", ms: 0, stopReason: "cancelled", activity: [], text: "" });
-      return { text: "", stopReason: "cancelled", log: [], ms: 0 };
-    };
-    // Honour a cancel that arrived while this turn waited in the queue or during startup.
-    if (opts.signal?.aborted) return logCancel();
-    await this.ensureStarted();
-    if (opts.signal?.aborted) return logCancel();
+  // --- event channel ------------------------------------------------------
 
+  private pushEvent(event: TurnEvent): void {
+    const waiter = this.eventWaiter;
+    if (waiter) {
+      this.eventWaiter = undefined;
+      waiter(event);
+    } else {
+      this.eventQueue.push(event);
+    }
+  }
+
+  private nextEvent(): Promise<TurnEvent> {
+    const buffered = this.eventQueue.shift();
+    if (buffered) return Promise.resolve(buffered);
+    return new Promise<TurnEvent>((resolve) => {
+      this.eventWaiter = resolve;
+    });
+  }
+
+  // --- turn lifecycle -----------------------------------------------------
+
+  private async acquireGate(): Promise<void> {
+    const prev = this.turnGate;
+    let release!: () => void;
+    this.turnGate = new Promise<void>((r) => (release = r));
+    await prev;
+    this.releaseGate = release;
+  }
+
+  private endTurn(): void {
+    this.awaitingDecision = undefined;
+    this.eventQueue = [];
+    this.eventWaiter = undefined;
+    this.turnOnText = undefined;
+    this.turnOnActivity = undefined;
+    this.releaseGate?.();
+    this.releaseGate = undefined;
+  }
+
+  private snapshot(stopReason: string, usage?: Usage): AskResult {
+    const result: AskResult = {
+      text: this.turnText.trim(),
+      stopReason,
+      log: [...this.turnLog],
+      ms: this.turnStart > 0 ? Date.now() - this.turnStart : 0,
+      usage,
+    };
+    logTurn(this.config, {
+      tool: this.turnLabel,
+      ms: result.ms,
+      stopReason,
+      totalTokens: usage?.totalTokens,
+      activity: result.log,
+      text: result.text,
+    });
+    return result;
+  }
+
+  private launchTurn(prompt: string): void {
+    this.conn!.prompt({ sessionId: this.sessionId!, prompt: [{ type: "text", text: prompt }] }).then(
+      (res) => this.pushEvent({ kind: "done", result: this.snapshot(res.stopReason, res.usage ?? undefined) }),
+      (err) => this.pushEvent({ kind: "failed", error: err as Error }),
+    );
+  }
+
+  /** Start a new prompt turn. Returns Codex's answer or a permission to judge. */
+  async ask(prompt: string, opts: AskOptions = {}): Promise<TurnOutcome> {
+    // A prior turn suspended awaiting a decision Claude never made — abandon it.
+    if (this.releaseGate) {
+      this.forceReset();
+      this.endTurn();
+    }
+    await this.acquireGate();
+    this.turnLabel = opts.label ?? "turn";
     this.turnText = "";
     this.turnLog = [];
+    this.turnStart = Date.now();
+    this.eventQueue = [];
+    this.eventWaiter = undefined;
+    try {
+      const ok = await this.ensureStartedAbortable(opts.signal);
+      if (!ok) {
+        const result = this.snapshot("cancelled");
+        this.endTurn();
+        return { type: "answer", result };
+      }
+    } catch (err) {
+      this.endTurn();
+      throw err;
+    }
+    this.launchTurn(prompt);
+    return this.drive(opts);
+  }
+
+  /** Resolve the pending permission and resume the suspended turn. */
+  async permit(allow: boolean, opts: AskOptions = {}, note?: string): Promise<TurnOutcome> {
+    const permission = this.awaitingDecision;
+    if (!permission) throw new Error("no pending permission to decide");
+    this.awaitingDecision = undefined;
+    this.turnLog.push(`${allow ? "allowed" : "denied"} by claude${note ? `: ${note}` : ""}`);
+    permission.decide(allow);
+    return this.drive(opts);
+  }
+
+  /** Wait for the next turn event, applying streaming, cancel, and timeout. */
+  private async drive(opts: AskOptions): Promise<TurnOutcome> {
     this.turnOnText = opts.onText;
     this.turnOnActivity = opts.onActivity;
-    const started = Date.now();
 
-    // One controller fires on either the caller's cancel or our turn timeout.
     const ctrl = new AbortController();
-    const onExternalAbort = () => ctrl.abort();
+    const onExternalAbort = (): void => ctrl.abort();
     opts.signal?.addEventListener("abort", onExternalAbort, { once: true });
     let timedOut = false;
     const timer = setTimeout(() => {
@@ -218,9 +396,8 @@ export class CodexSession {
       ctrl.abort();
     }, this.config.turnTimeoutMs);
 
-    // On abort we ask codex-acp to cancel, then arm a hard stop: ACP cancel is
-    // only a notification, so a wedged or cancel-ignoring agent could otherwise
-    // keep `prompt()` (and the serialized queue) pending forever.
+    // On abort, ask codex-acp to cancel, then arm a hard stop: ACP cancel is only
+    // a notification, so a wedged agent could otherwise keep the turn pending.
     let hardStop = false;
     const abandoned = new Promise<never>((_, reject) => {
       const arm = (): void => {
@@ -235,46 +412,45 @@ export class CodexSession {
       else ctrl.signal.addEventListener("abort", arm, { once: true });
     });
 
-    const finish = (stopReason: string, usage?: Usage): AskResult => {
-      const result: AskResult = {
-        text: this.turnText.trim(),
-        stopReason,
-        log: [...this.turnLog],
-        ms: Date.now() - started,
-        usage,
-      };
-      logTurn(this.config, {
-        tool: opts.label ?? "turn",
-        ms: result.ms,
-        stopReason,
-        totalTokens: usage?.totalTokens,
-        activity: result.log,
-        text: result.text,
-      });
-      return result;
-    };
-
-    const pending = this.conn!.prompt({
-      sessionId: this.sessionId!,
-      prompt: [{ type: "text", text: prompt }],
-    });
-    try {
-      const res = await Promise.race([pending, abandoned]);
-      return finish(timedOut ? "timeout" : res.stopReason, res.usage ?? undefined);
-    } catch (err) {
-      if (hardStop) {
-        pending.catch(() => {}); // the abandoned prompt may settle later — swallow it
-        this.forceReset(); // agent state is now unknown; respawn on the next turn
-        return finish(timedOut ? "timeout" : "cancelled");
-      }
-      // A clean cancel often surfaces as a rejected prompt; report it gracefully.
-      if (ctrl.signal.aborted) return finish(timedOut ? "timeout" : "cancelled");
-      throw err;
-    } finally {
+    const clearSegment = (): void => {
       clearTimeout(timer);
       opts.signal?.removeEventListener("abort", onExternalAbort);
       this.turnOnText = undefined;
       this.turnOnActivity = undefined;
+    };
+
+    try {
+      const event = await Promise.race([this.nextEvent(), abandoned]);
+      if (event.kind === "permission") {
+        // Suspend: keep the turn open; the wait for Claude's decision isn't timed.
+        this.awaitingDecision = event.permission;
+        clearSegment();
+        return { type: "permission", description: event.permission.description };
+      }
+      if (event.kind === "failed") {
+        clearSegment();
+        if (ctrl.signal.aborted) {
+          const result = this.snapshot(timedOut ? "timeout" : "cancelled");
+          this.endTurn();
+          return { type: "answer", result };
+        }
+        this.endTurn();
+        throw event.error;
+      }
+      clearSegment();
+      this.endTurn();
+      return { type: "answer", result: event.result };
+    } catch (err) {
+      if (hardStop || ctrl.signal.aborted) {
+        if (hardStop) this.forceReset();
+        const result = this.snapshot(timedOut ? "timeout" : "cancelled");
+        clearSegment();
+        this.endTurn();
+        return { type: "answer", result };
+      }
+      clearSegment();
+      this.endTurn();
+      throw err;
     }
   }
 
@@ -301,6 +477,7 @@ export class CodexSession {
       },
       sessionStarted: this.sessionId !== undefined,
       childAlive: child !== undefined && child.exitCode === null && !child.killed,
+      pendingPermission: this.awaitingDecision?.description,
       stderrTail: this.stderr.join("").trim().slice(-600),
     };
   }

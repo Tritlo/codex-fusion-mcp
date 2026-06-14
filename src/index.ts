@@ -5,7 +5,7 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { loadConfig } from "./config.ts";
-import { CodexSession, type AskResult, type SessionStatus } from "./codex.ts";
+import { CodexSession, type AskOptions, type AskResult, type SessionStatus, type TurnOutcome } from "./codex.ts";
 import {
   brainstormPrompt,
   consultPrompt,
@@ -23,8 +23,8 @@ type ToolResult = { content: Array<{ type: "text"; text: string }> };
 
 const fmtTokens = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`);
 
-/** Render a turn for Claude: Codex's answer, then a terse one-line footer. */
-function render(result: AskResult): ToolResult {
+/** Render a finished turn for Claude: Codex's answer, then a terse one-line footer. */
+function renderAnswer(result: AskResult): ToolResult {
   const body = result.text.length > 0 ? result.text : "_(codex returned no text)_";
   const stop =
     result.stopReason === "end_turn"
@@ -36,18 +36,36 @@ function render(result: AskResult): ToolResult {
           : `\n\n_(codex stopped: ${result.stopReason})_`;
   const parts = [`${(result.ms / 1000).toFixed(1)}s`];
   if (result.usage) parts.push(`${fmtTokens(result.usage.totalTokens)} tok`);
-  const blocked = result.log.filter((l) => l.startsWith("denied")).length;
-  if (blocked > 0) parts.push(`⚠ ${blocked} blocked`);
   return { content: [{ type: "text", text: `${body}${stop}\n\n_${parts.join(" · ")}_` }] };
+}
+
+/** Render whatever a turn produced: an answer, or a permission for Claude to judge. */
+function renderOutcome(outcome: TurnOutcome): ToolResult {
+  if (outcome.type === "permission") {
+    return {
+      content: [
+        {
+          type: "text",
+          text:
+            `🔐 Codex paused and needs your permission to continue:\n\n` +
+            `    ${outcome.description}\n\n` +
+            `Decide whether this is reasonable, then call **permit** with decision \`allow\` or ` +
+            `\`deny\` to resume the turn — Codex is waiting on the same session.`,
+        },
+      ],
+    };
+  }
+  return renderAnswer(outcome.result);
 }
 
 /** Last line / tail of the streamed text so far, for a rolling live view. */
 const tail = (s: string): string => s.replace(/\s+/g, " ").trim().slice(-140);
 
-/** Run a Codex turn, streaming progress to the client and honouring cancel. */
-function ask(prompt: string, extra: Extra, label: string): Promise<ToolResult> {
+/** Streaming hooks that forward Codex's output to the client as progress. */
+function streamHooks(extra: Extra): Pick<AskOptions, "onText" | "onActivity"> {
   const token = extra._meta?.progressToken;
   let progress = 0;
+  let acc = "";
   const notify = (message: string): void => {
     if (token === undefined) return;
     void extra.sendNotification({
@@ -55,18 +73,18 @@ function ask(prompt: string, extra: Extra, label: string): Promise<ToolResult> {
       params: { progressToken: token, progress: ++progress, message },
     });
   };
-  let acc = "";
-  return codex
-    .ask(prompt, {
-      label,
-      signal: extra.signal,
-      onText: (chunk) => {
-        acc += chunk;
-        notify(tail(acc));
-      },
-      onActivity: (note) => notify(`↳ ${note}`),
-    })
-    .then(render);
+  return {
+    onText: (chunk) => {
+      acc += chunk;
+      notify(tail(acc));
+    },
+    onActivity: (note) => notify(`↳ ${note}`),
+  };
+}
+
+/** Start a Codex turn, streaming progress and honouring cancellation. */
+function ask(prompt: string, extra: Extra, label: string): Promise<ToolResult> {
+  return codex.ask(prompt, { label, signal: extra.signal, ...streamHooks(extra) }).then(renderOutcome);
 }
 
 const server = new McpServer({ name: "codex-fusion", version: "0.1.0" });
@@ -104,7 +122,7 @@ server.registerTool(
   "review_diff",
   {
     description:
-      "Have Codex review code changes for correctness bugs and gaps. Pass a diff, or name paths and let Codex read the working tree. Codex debates back; continue with `reply`.",
+      "Have Codex review code changes for correctness bugs and gaps. Pass a diff, or name paths and let Codex read the working tree (it may ask permission to run `git diff`). Codex debates back; continue with `reply`.",
     inputSchema: {
       diff: z.string().optional().describe("A unified diff to review. Omit to let Codex inspect `git diff` itself."),
       paths: z.string().optional().describe("Paths to focus on (used when no diff is supplied)."),
@@ -153,10 +171,36 @@ server.registerTool(
 );
 
 server.registerTool(
+  "permit",
+  {
+    description:
+      "Resolve a permission request Codex raised mid-turn (when a consult/review/etc. just returned a 🔐 permission). Judge whether the action is reasonable, then allow or deny; Codex's suspended turn resumes and runs to its next pause or its answer. Only valid right after a tool returned a permission request.",
+    inputSchema: {
+      decision: z.enum(["allow", "deny"]).describe("Whether to let Codex perform the requested action."),
+      note: z.string().optional().describe("Optional short reason for the decision (recorded in the debug log)."),
+    },
+  },
+  ({ decision, note }, extra) =>
+    codex
+      .permit(decision === "allow", { label: "permit", signal: extra.signal, ...streamHooks(extra) }, note)
+      .then(renderOutcome)
+      .catch(
+        (err: unknown): ToolResult => ({
+          content: [
+            {
+              type: "text",
+              text: `No pending permission to resolve (${(err as Error).message}). It may have already completed or been superseded by a newer request.`,
+            },
+          ],
+        }),
+      ),
+);
+
+server.registerTool(
   "status",
   {
     description:
-      "Report codex-fusion's health: workspace, guardian flags, whether the Codex session/subprocess is alive, and recent codex-acp stderr. Read-only; does not start a session.",
+      "Report codex-fusion's health: workspace, guardian flags, whether the Codex session/subprocess is alive, and any pending permission. Read-only; does not start a session.",
     inputSchema: {},
   },
   () => ({ content: [{ type: "text" as const, text: renderStatus(codex.status()) }] }),
@@ -169,6 +213,7 @@ function renderStatus(s: SessionStatus): string {
     `acp command: ${s.acpCommand}`,
     `guardian: external-reads ${onoff(s.guardian.externalReads)} · writes ${onoff(s.guardian.writes)} · commands ${onoff(s.guardian.commands)}`,
     `session: ${s.sessionStarted ? "started" : "not started"} · subprocess: ${s.childAlive ? "alive" : "down"}`,
+    s.pendingPermission ? `awaiting permit: ${s.pendingPermission}` : "no pending permission",
     s.stderrTail ? `\nrecent codex-acp stderr:\n${s.stderrTail}` : "no codex-acp stderr captured",
   ].join("\n");
 }

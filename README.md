@@ -21,7 +21,8 @@ keeps one persistent Codex session per workspace.
 | `brainstorm` | get 2–4 alternative approaches with trade-offs + a recommendation |
 | `explore` | map an unfamiliar codebase (structure, components, flow, conventions) |
 | `reply` | continue the debate — push back on Codex's last answer on the same session |
-| `status` | report health: workspace, guardian flags, whether Codex is alive |
+| `permit` | allow/deny a permission Codex raised mid-turn, then resume it |
+| `status` | report health: workspace, guardian flags, session liveness, pending permission |
 
 All tools are **advisory** — Codex answers, you decide.
 
@@ -33,14 +34,27 @@ with a `VERDICT: CONSENSUS — …` or `VERDICT: OPEN — …` line. When it's `
 push back with `reply` (same persistent session, so Codex keeps the thread) and
 drive toward consensus — keep it to ~3 turns.
 
+### Permissions: Claude is the guardian
+
+When Codex wants to do something guardian doesn't auto-allow, the turn **pauses
+and hands the decision back to Claude** — no static allowlist, no human prompt.
+The tool returns `🔐 Codex paused … <what it wants>`; Claude judges whether it's
+reasonable and calls `permit allow|deny`, which resolves the held-open request
+and resumes the same suspended turn. Only the cheap, safe cases are auto-allowed
+without asking: reads and searches **inside** the workspace. Everything else —
+commands, writes, network, out-of-workspace reads — comes back to Claude. The
+`ALLOW_*` flags downgrade a whole category from "ask Claude" to "auto-allow".
+
 ### Streaming & cancellation
 
-Turns stream live: Codex's text and a `↳ reading …` activity trail are sent as
-MCP progress notifications, so you can watch (and steer between turns). Cancel a
-turn and Codex is told to stop (`session/cancel`). A turn that runs past
-`CODEX_FUSION_TURN_TIMEOUT_MS` is aborted so it can't wedge the queue. The tool
-result stays focused on Codex's answer plus a one-line footer (latency, tokens,
-and any blocked actions); the full play-by-play goes to the debug log.
+Turns stream live: Codex's text and a `↳ …` activity trail are sent as MCP
+progress notifications, so you can watch (and steer between turns). Cancel a turn
+and Codex is told to stop (`session/cancel`); if it ignores the cancel, a short
+grace later the turn is hard-stopped and the subprocess respawned, so it can't
+wedge the queue. A turn that runs past `CODEX_FUSION_TURN_TIMEOUT_MS` of active
+work is aborted the same way (the wait for a `permit` decision is **not** timed).
+The tool result stays focused on Codex's answer plus a one-line footer (latency,
+tokens); the full play-by-play goes to the debug log.
 
 ## Requirements
 
