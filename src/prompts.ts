@@ -18,6 +18,13 @@ const MISSING_CONTEXT = `<missing_context_gating>
 Do not guess missing repository facts. Read the relevant files to confirm. If something needed is genuinely unavailable, state exactly what remains unknown.
 </missing_context_gating>`;
 
+const DEBATE = `<debate>
+This is a short back-and-forth with Claude, not a one-shot answer. Claude may push back — engage the strongest version of its counter-argument. Concede the points it gets right and hold the ones you can defend, with reasons. Aim to converge on the best answer within ~3 exchanges.
+End every reply with a final line, exactly one of:
+VERDICT: CONSENSUS — <the agreed conclusion in one sentence>
+VERDICT: OPEN — <the single most important point still unresolved>
+</debate>`;
+
 function assemble(...blocks: string[]): string {
   return [PREAMBLE, ...blocks].join("\n\n");
 }
@@ -36,6 +43,7 @@ export function consultPrompt(question: string, context?: string): string {
     `<compact_output_contract>\nAnswer directly first (≤3 sentences), then the key reasoning as a few bullets. If Claude's framing has a wrong assumption, say so up front. No preamble or recap.\n</compact_output_contract>`,
     GROUNDING,
     MISSING_CONTEXT,
+    DEBATE,
   );
 }
 
@@ -47,6 +55,7 @@ export function reviewPlanPrompt(plan: string, context?: string): string {
     `<structured_output_contract>\nReturn, highest-impact first:\n1. Verdict — sound / sound with changes / reconsider.\n2. Problems — concrete issues, each with why it matters and a fix. Ordered by severity.\n3. Blind spots — edge cases, failure modes, or simpler alternatives the plan ignores.\n4. Agreements — parts that are right (brief), so Claude knows what to keep.\nBe specific; skip generic advice.\n</structured_output_contract>`,
     `<dig_deeper_nudge>\nAfter the first issue, check second-order effects: error paths, empty/initial state, concurrency, rollback, and whether a smaller design would do.\n</dig_deeper_nudge>`,
     GROUNDING,
+    DEBATE,
   );
 }
 
@@ -63,6 +72,7 @@ export function reviewDiffPrompt(opts: { diff?: string; paths?: string; instruct
     `<dig_deeper_nudge>\nBeyond the obvious: empty-state and error paths, off-by-one and boundary conditions, stale/duplicated state, missing cleanup, and behavior changes that break callers.\n</dig_deeper_nudge>`,
     GROUNDING,
     MISSING_CONTEXT,
+    DEBATE,
   );
 }
 
@@ -76,7 +86,17 @@ export function brainstormPrompt(problem: string, constraints?: string): string 
     `<research_mode>\nSeparate observed facts, reasoned inferences, and open questions. Go broad first, then deeper only where it changes the recommendation.\n</research_mode>`,
     `<compact_output_contract>\nGive 2–4 distinct approaches. For each: one-line summary, key trade-offs, and when to prefer it. End with a single recommendation and why. No filler.\n</compact_output_contract>`,
     GROUNDING,
+    DEBATE,
   );
+}
+
+/** A plain follow-up turn continuing the current debate on the live session. */
+export function replyPrompt(message: string): string {
+  return [
+    `<reply>\n${message.trim()}\n</reply>`,
+    `Continue the debate: respond to Claude's points directly, update your position where warranted, and keep grounding claims in the repository.`,
+    DEBATE,
+  ].join("\n\n");
 }
 
 /** Initial exploration: map an unfamiliar codebase. */
