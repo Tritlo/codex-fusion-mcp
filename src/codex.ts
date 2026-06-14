@@ -228,6 +228,9 @@ export class CodexSession {
     try {
       await conn.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
       const session = await conn.newSession({ cwd: this.config.workspaceRoot, mcpServers: [] });
+      // If startup was superseded (aborted/timed-out → forceReset, or a respawn)
+      // while newSession was in flight, don't bind a session to a dead child.
+      if (this.child !== child) throw new Error("codex-acp startup superseded");
       this.sessionId = session.sessionId;
     } catch (err) {
       const tail = this.stderr.join("").trim().slice(-600);
@@ -376,7 +379,9 @@ export class CodexSession {
   /** Start a new prompt turn. Returns Codex's answer or a permission to judge. */
   async ask(prompt: string, opts: AskOptions = {}): Promise<TurnOutcome> {
     // A prior turn suspended awaiting a decision Claude never made — abandon it.
-    if (this.awaitingDecision || this.releaseGate) {
+    // Key on awaitingDecision (the suspended marker), not releaseGate, which is
+    // set for every in-flight turn and would wrongly abandon a running one.
+    if (this.awaitingDecision) {
       this.turnId++; // invalidate the old turn's in-flight async work
       this.forceReset();
       this.awaitingDecision = undefined;
@@ -415,8 +420,11 @@ export class CodexSession {
     const permission = this.awaitingDecision;
     if (!permission) throw new NoPendingPermission();
     this.awaitingDecision = undefined;
-    this.turnLog.push(`${allow ? "allowed" : "denied"} by claude${note ? `: ${note}` : ""}`);
-    permission.decide(allow);
+    // If the permit call was already cancelled, never approve — downgrade to deny;
+    // drive() then observes the abort and cancels the turn.
+    const granted = allow && !opts.signal?.aborted;
+    this.turnLog.push(`${granted ? "allowed" : "denied"} by claude${note ? `: ${note}` : ""}`);
+    permission.decide(granted);
     return this.drive(opts, this.turnId); // same generation as the suspended turn
   }
 
