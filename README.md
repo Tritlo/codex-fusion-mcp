@@ -152,21 +152,16 @@ resets Codex for both; that only discards advisory context, never corrupts it.
 
 ### Guardian mode
 
-By default the server runs in **guardian mode**: Codex may only *read inside the
-workspace*. Writes, network fetches, and reads that escape the workspace root are
-refused automatically, and each decision is reported back to Claude (in the debug
-log). Flip the `ALLOW_*` flags to widen one category at a time. The policy lives
-in [`src/permissions.ts`](src/permissions.ts) as a single pure function.
-
-**Read-only commands are allowed by default** so review tools work without
-opening the command floodgates: Codex may run a single read-only invocation —
-git read subcommands (`diff`, `status`, `log`, `show`, `blame`, …) and tools like
-`cat`/`ls`/`rg`/`grep`/`head`/`wc` — but anything that chains, substitutes, or
-redirects (`;`, `|`, `&`, `` ` ``, `$(`, `>`) is refused, as is any non-read-only
-program. Commands are held to the *same* workspace boundary as the read tool:
-path arguments that escape the root (absolute outside, `..`, `~`) are blocked
-unless `ALLOW_EXTERNAL_READS` is set. `ALLOW_COMMANDS` still removes the
-allowlist entirely and permits any command.
+By default the server runs in **guardian mode**: Codex may only *read and search
+inside the workspace* without asking. Everything else — writes, network fetches,
+command execution, and reads that escape the workspace root — isn't auto-refused;
+the turn **pauses and hands the request to Claude** to allow or deny (see
+[Permissions: Claude is the guardian](#permissions-claude-is-the-guardian)), and
+every decision is logged. So `review_diff` can run `git diff` the moment you
+allow it — there's no static command allowlist to outwit (see ADR 0003). The
+`ALLOW_*` flags downgrade a whole category (external reads + fetch, writes, or
+commands) from "ask Claude" to auto-allow; the policy is a single pure function
+in [`src/permissions.ts`](src/permissions.ts).
 
 ## Layout
 
