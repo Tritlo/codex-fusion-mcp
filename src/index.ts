@@ -37,7 +37,7 @@ function renderAnswer(result: AskResult): ToolResult {
     result.stopReason === "end_turn"
       ? ""
       : result.stopReason === "timeout"
-        ? "\n\n_(codex timed out — raise CODEX_FUSION_TURN_TIMEOUT_MS or narrow the question)_"
+        ? "\n\n_(codex went silent — pass a larger `time` (seconds) to extend the idle timeout, or narrow the question)_"
         : result.stopReason === "cancelled"
           ? "\n\n_(cancelled)_"
           : `\n\n_(codex stopped: ${result.stopReason})_`;
@@ -95,9 +95,29 @@ function streamHooks(extra: Extra): Pick<AskOptions, "onText" | "onThought" | "o
 }
 
 /** Start a Codex turn, streaming progress and honouring cancellation. */
-function ask(prompt: string, extra: Extra, label: string): Promise<ToolResult> {
-  return codex.ask(prompt, { label, signal: extra.signal, ...streamHooks(extra) }).then(renderOutcome);
+function ask(prompt: string, extra: Extra, label: string, time?: number): Promise<ToolResult> {
+  const timeoutMs = time !== undefined ? time * 1000 : undefined;
+  return codex
+    .ask(prompt, { label, signal: extra.signal, timeoutMs, ...streamHooks(extra) })
+    .then(renderOutcome);
 }
+
+/**
+ * Optional per-call override of the idle timeout, in seconds. The clock is
+ * measured from Codex's last output, so an actively-working turn is never cut
+ * off; raise this only for big reviews/explorations that may pause for long
+ * stretches (e.g. a slow tool call) before producing more output.
+ */
+const timeField = {
+  time: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe(
+      "Optional idle timeout in seconds for this call, overriding the default. The clock runs from Codex's last output, so a turn that keeps streaming is never cut off — raise this for large reviews/explorations that may go quiet for a while.",
+    ),
+};
 
 const server = new McpServer({ name: "codex-fusion", version: "0.1.0" });
 
@@ -112,9 +132,10 @@ server.registerTool(
         .string()
         .optional()
         .describe("Optional background: your current thinking, constraints, or relevant snippets."),
+      ...timeField,
     },
   },
-  ({ question, context }, extra) => ask(consultPrompt(question, context), extra, "consult"),
+  ({ question, context, time }, extra) => ask(consultPrompt(question, context), extra, "consult", time),
 );
 
 server.registerTool(
@@ -125,9 +146,10 @@ server.registerTool(
     inputSchema: {
       plan: z.string().describe("The plan/approach to review (steps, design, or intended changes)."),
       context: z.string().optional().describe("Optional background or constraints."),
+      ...timeField,
     },
   },
-  ({ plan, context }, extra) => ask(reviewPlanPrompt(plan, context), extra, "review_plan"),
+  ({ plan, context, time }, extra) => ask(reviewPlanPrompt(plan, context), extra, "review_plan", time),
 );
 
 server.registerTool(
@@ -139,9 +161,11 @@ server.registerTool(
       diff: z.string().optional().describe("A unified diff to review. Omit to let Codex inspect `git diff` itself."),
       paths: z.string().optional().describe("Paths to focus on (used when no diff is supplied)."),
       instructions: z.string().optional().describe("Optional extra focus for the review."),
+      ...timeField,
     },
   },
-  ({ diff, paths, instructions }, extra) => ask(reviewDiffPrompt({ diff, paths, instructions }), extra, "review_diff"),
+  ({ diff, paths, instructions, time }, extra) =>
+    ask(reviewDiffPrompt({ diff, paths, instructions }), extra, "review_diff", time),
 );
 
 server.registerTool(
@@ -152,9 +176,11 @@ server.registerTool(
     inputSchema: {
       problem: z.string().describe("The design problem to explore."),
       constraints: z.string().optional().describe("Optional constraints, requirements, or non-goals."),
+      ...timeField,
     },
   },
-  ({ problem, constraints }, extra) => ask(brainstormPrompt(problem, constraints), extra, "brainstorm"),
+  ({ problem, constraints, time }, extra) =>
+    ask(brainstormPrompt(problem, constraints), extra, "brainstorm", time),
 );
 
 server.registerTool(
@@ -165,9 +191,10 @@ server.registerTool(
     inputSchema: {
       focus: z.string().optional().describe("What to focus the exploration on (a feature, subsystem, or question)."),
       paths: z.string().optional().describe("Optional starting paths."),
+      ...timeField,
     },
   },
-  ({ focus, paths }, extra) => ask(explorePrompt(focus, paths), extra, "explore"),
+  ({ focus, paths, time }, extra) => ask(explorePrompt(focus, paths), extra, "explore", time),
 );
 
 server.registerTool(
@@ -177,9 +204,10 @@ server.registerTool(
       "Continue the current debate: send a rebuttal or follow-up to Codex on the SAME session (it remembers the thread). Use to push back on Codex's last answer and drive toward consensus — keep the whole debate to ~3 turns.",
     inputSchema: {
       message: z.string().describe("Your rebuttal, counter-point, or follow-up question for Codex."),
+      ...timeField,
     },
   },
-  ({ message }, extra) => ask(replyPrompt(message), extra, "reply"),
+  ({ message, time }, extra) => ask(replyPrompt(message), extra, "reply", time),
 );
 
 server.registerTool(
@@ -190,11 +218,21 @@ server.registerTool(
     inputSchema: {
       decision: z.enum(["allow", "deny"]).describe("Whether to let Codex perform the requested action."),
       note: z.string().optional().describe("Optional short reason for the decision (recorded in the debug log)."),
+      ...timeField,
     },
   },
-  ({ decision, note }, extra) =>
+  ({ decision, note, time }, extra) =>
     codex
-      .permit(decision === "allow", { label: "permit", signal: extra.signal, ...streamHooks(extra) }, note)
+      .permit(
+        decision === "allow",
+        {
+          label: "permit",
+          signal: extra.signal,
+          timeoutMs: time !== undefined ? time * 1000 : undefined,
+          ...streamHooks(extra),
+        },
+        note,
+      )
       .then(renderOutcome)
       .catch((err: unknown): ToolResult => {
         // Only swallow the "nothing to resolve" case; a failure inside the

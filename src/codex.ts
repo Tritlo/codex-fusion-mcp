@@ -19,6 +19,19 @@ import { resetNonceFile } from "./reset.ts";
 /** Grace after an ACP cancel before we hard-stop a wedged turn and respawn. */
 const HARD_STOP_GRACE_MS = 1500;
 
+/**
+ * ACP `sessionUpdate` kinds that count as Codex making progress, and so reset the
+ * idle timeout. Everything else (usage/mode/config/commands/session-info, and the
+ * echoed user message) is housekeeping that must not keep a wedged turn alive.
+ */
+const LIVENESS_UPDATES = new Set<SessionNotification["update"]["sessionUpdate"]>([
+  "agent_message_chunk",
+  "agent_thought_chunk",
+  "tool_call",
+  "tool_call_update",
+  "plan",
+]);
+
 /** Thrown by {@link CodexSession.permit} when no turn is awaiting a decision. */
 export class NoPendingPermission extends Error {
   constructor() {
@@ -54,6 +67,8 @@ export interface AskOptions {
   onThought?: (chunk: string) => void;
   /** Called with each guardian decision / tool call, for a live activity view. */
   onActivity?: (note: string) => void;
+  /** Override the idle timeout (ms) for this turn; falls back to the config default. */
+  timeoutMs?: number;
 }
 
 /** A permission Codex raised mid-turn, awaiting Claude's allow/deny. */
@@ -121,6 +136,9 @@ export class CodexSession {
   private eventQueue: TurnEvent[] = [];
   private eventWaiter?: (e: TurnEvent) => void;
   private awaitingDecision?: PendingPermission;
+  // Set by the active drive() segment; the ACP sessionUpdate callback calls it on
+  // every chunk so the idle timeout is measured from Codex's *last* output.
+  private bumpIdle?: () => void;
 
   // Serializes turns; the holder releases it when the turn fully ends.
   private turnGate: Promise<void> = Promise.resolve();
@@ -182,6 +200,10 @@ export class CodexSession {
       sessionUpdate: async (params: SessionNotification): Promise<void> => {
         if (params.sessionId !== this.sessionId) return; // drop stale-session updates
         const u = params.update;
+        // Real output (text, reasoning, tool progress, plan) resets the idle
+        // timeout. Housekeeping updates (usage/mode/config/commands/session-info)
+        // are not progress, so they must not keep a wedged turn alive.
+        if (LIVENESS_UPDATES.has(u.sessionUpdate)) this.bumpIdle?.();
         switch (u.sessionUpdate) {
           case "agent_message_chunk":
             if (u.content.type === "text") {
@@ -285,17 +307,18 @@ export class CodexSession {
    * timeout (a wedged `initialize`/`newSession` must not pin the gate). Returns
    * false if cancelled; throws on startup failure or timeout.
    */
-  private async ensureStartedAbortable(signal?: AbortSignal): Promise<boolean> {
+  private async ensureStartedAbortable(signal?: AbortSignal, timeoutMs?: number): Promise<boolean> {
     if (this.sessionId) return true;
     if (signal?.aborted) return false;
+    const limit = timeoutMs ?? this.config.turnTimeoutMs;
     const startup = this.ensureStarted();
     startup.catch(() => {}); // we may stop awaiting it below; don't leak a rejection
     return await new Promise<boolean>((resolve, reject) => {
       const timer = setTimeout(() => {
         cleanup();
         this.forceReset();
-        reject(new Error(`codex-acp startup timed out after ${this.config.turnTimeoutMs}ms`));
-      }, this.config.turnTimeoutMs);
+        reject(new Error(`codex-acp startup timed out after ${limit}ms`));
+      }, limit);
       const onAbort = (): void => {
         cleanup();
         this.forceReset(); // kill a wedged/half-started child so it can't pin the queue
@@ -409,8 +432,9 @@ export class CodexSession {
     this.turnStart = Date.now();
     this.eventQueue = [];
     this.eventWaiter = undefined;
+    const timeoutMs = opts.timeoutMs ?? this.config.turnTimeoutMs;
     try {
-      const ok = await this.ensureStartedAbortable(opts.signal);
+      const ok = await this.ensureStartedAbortable(opts.signal, timeoutMs);
       if (!ok) {
         const result = this.snapshot("cancelled");
         this.finish(id);
@@ -450,11 +474,32 @@ export class CodexSession {
     const onExternalAbort = (): void => ctrl.abort();
     opts.signal?.addEventListener("abort", onExternalAbort, { once: true });
     if (opts.signal?.aborted) ctrl.abort(); // listener won't fire for an already-aborted signal
+
+    // Idle timeout, measured from Codex's *last* output: bumpIdle (called from the
+    // sessionUpdate callback on every chunk) pushes lastActivity forward, and the
+    // timer re-arms for the remaining window instead of firing. An actively-
+    // streaming turn is therefore never cut off — only true silence aborts, so a
+    // long review/exploration keeps its partial output instead of being killed.
+    // Monotonic clock: a wall-clock jump (NTP, laptop/WSL2 suspend-resume) must not
+    // make the watchdog fire early and abort a live turn — the exact regression we
+    // are removing.
+    const timeoutMs = opts.timeoutMs ?? this.config.turnTimeoutMs;
     let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      ctrl.abort();
-    }, this.config.turnTimeoutMs);
+    let lastActivity = performance.now();
+    this.bumpIdle = (): void => {
+      lastActivity = performance.now();
+    };
+    let timer: ReturnType<typeof setTimeout>;
+    const armIdle = (): void => {
+      const remaining = timeoutMs - (performance.now() - lastActivity);
+      if (remaining <= 0) {
+        timedOut = true;
+        ctrl.abort();
+      } else {
+        timer = setTimeout(armIdle, remaining);
+      }
+    };
+    timer = setTimeout(armIdle, timeoutMs);
 
     // On abort, ask codex-acp to cancel, then arm a hard stop: ACP cancel is only
     // a notification, so a wedged agent could otherwise keep the turn pending.
@@ -475,7 +520,10 @@ export class CodexSession {
     const clearSegment = (): void => {
       clearTimeout(timer);
       opts.signal?.removeEventListener("abort", onExternalAbort);
+      // Only a current segment owns the shared callbacks; a superseded segment must
+      // not clear them out from under the newer turn that now holds them.
       if (id === this.turnId) {
+        this.bumpIdle = undefined;
         this.turnOnText = undefined;
         this.turnOnThought = undefined;
         this.turnOnActivity = undefined;

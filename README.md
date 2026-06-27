@@ -55,10 +55,14 @@ client resets its request timeout on progress, so forwarding Codex's thinking
 keeps a long, silently-reasoning turn from being cancelled by the client. Cancel
 a turn and Codex is told to stop (`session/cancel`); if it ignores the cancel, a
 short grace later the turn is hard-stopped and the subprocess respawned, so it
-can't wedge the queue. A turn that runs past `CODEX_FUSION_TURN_TIMEOUT_MS` of
-active work is aborted the same way (the wait for a `permit` decision is **not**
-timed). If your client caps tool calls more tightly, raise its timeout too — for
-Claude Code, `MCP_TOOL_TIMEOUT` (e.g. `300000`).
+can't wedge the queue. The turn timeout is an **idle** timeout: it fires only
+after `CODEX_FUSION_TURN_TIMEOUT_MS` of *silence* (no text, reasoning, or
+tool-call output), and the clock resets on every chunk — so a turn that keeps
+streaming is never cut off, however long it runs, and you keep its partial output
+instead of losing it. Pass a per-call `time` (seconds) to any tool to widen that
+idle window for a single big review/exploration. (The wait for a `permit`
+decision is **not** timed.) If your client caps tool calls more tightly, raise
+its timeout too — for Claude Code, `MCP_TOOL_TIMEOUT` (e.g. `600000`).
 The tool result stays focused on Codex's answer plus a one-line footer (latency,
 tokens); the full play-by-play goes to the debug log.
 
@@ -147,7 +151,7 @@ resets Codex for both; that only discards advisory context, never corrupts it.
 | `CODEX_FUSION_ALLOW_EXTERNAL_READS` | off | Let Codex read outside the workspace + use network fetch. |
 | `CODEX_FUSION_ALLOW_WRITES` | off | Let Codex edit/delete/move files inside the workspace. |
 | `CODEX_FUSION_ALLOW_COMMANDS` | off | Let Codex run shell commands. |
-| `CODEX_FUSION_TURN_TIMEOUT_MS` | `300000` | Abort a single Codex turn after this long of active work. |
+| `CODEX_FUSION_TURN_TIMEOUT_MS` | `600000` | Idle timeout: abort a turn after this long of *silence* (clock resets on every chunk). Override per call with the `time` arg (seconds). |
 | `CODEX_FUSION_LOG` | off | Append a full per-turn JSONL debug log to this path. |
 
 ### Guardian mode

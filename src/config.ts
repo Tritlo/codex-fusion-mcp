@@ -19,7 +19,12 @@ export interface Config {
   allowWrites: boolean;
   /** Expansion: let Codex run shell commands. */
   allowCommands: boolean;
-  /** Abort a single Codex turn after this many ms (frees the serialized queue). */
+  /**
+   * Idle timeout: abort a turn only after this many ms of *silence* (no text,
+   * reasoning, or tool-call output from Codex). The clock resets on every chunk,
+   * so an actively-streaming turn is never cut off — it frees the serialized
+   * queue only when Codex has genuinely wedged. A per-call `time` can override it.
+   */
   turnTimeoutMs: number;
   /** Optional path to append a full per-turn JSONL debug log to. */
   logFile?: string;
@@ -46,7 +51,7 @@ export function loadConfig(): Config {
     allowExternalReads: envBool("CODEX_FUSION_ALLOW_EXTERNAL_READS"),
     allowWrites: envBool("CODEX_FUSION_ALLOW_WRITES"),
     allowCommands: envBool("CODEX_FUSION_ALLOW_COMMANDS"),
-    turnTimeoutMs: envInt("CODEX_FUSION_TURN_TIMEOUT_MS", 300_000),
+    turnTimeoutMs: envInt("CODEX_FUSION_TURN_TIMEOUT_MS", 600_000),
     logFile: process.env.CODEX_FUSION_LOG?.trim() || undefined,
   };
 }
