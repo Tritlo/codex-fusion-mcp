@@ -46,9 +46,9 @@ function withContext(context: string | undefined): string {
   return context && context.trim().length > 0 ? `<context>\n${context.trim()}\n</context>` : "";
 }
 
-/** Shared block: a council turn is deliberation, not an agentic side-effect run. */
+/** Shared block: a council turn is read-only deliberation, not a side-effect run. */
 const DELIBERATION_ONLY = `<deliberation_only>
-This is a council deliberation: read the repository to ground your view, but do not modify files, run shell commands, or read outside the workspace — those are auto-declined here. If answering well would need one of them, say briefly what you could not inspect rather than attempting it. (Built-in web/X search is fine and encouraged where it helps.)
+This is a READ-ONLY council deliberation. You MAY read any files and search/fetch to ground your view — read whatever you need directly (don't shell out for it). You may NOT modify files or run shell commands: writes and command execution are auto-declined here. Built-in web/X search is fine and encouraged where it helps. If something genuinely can't be inspected, say so briefly rather than trying to run a command.
 </deliberation_only>`;
 
 /** A focused question / second opinion on a specific decision. */
@@ -66,9 +66,9 @@ export function consultPrompt(host: string, question: string, context?: string):
 }
 
 /** Critique a plan/approach before the host implements it. */
-export function reviewPlanPrompt(host: string, plan: string, context?: string): string {
+export function reviewPlanPrompt(advisor: string, host: string, plan: string, context?: string): string {
   return assemble(
-    CODEX,
+    advisor,
     host,
     `<task>\nReview this plan that ${host} intends to implement. Judge whether it is correct, complete, and the simplest approach that works.\n\n<plan>\n${plan.trim()}\n</plan>\n</task>`,
     withContext(context),
@@ -81,6 +81,7 @@ export function reviewPlanPrompt(host: string, plan: string, context?: string): 
 
 /** Review concrete code changes (a diff or named paths). */
 export function reviewDiffPrompt(
+  advisor: string,
   host: string,
   opts: { diff?: string; paths?: string; instructions?: string },
 ): string {
@@ -91,7 +92,7 @@ export function reviewDiffPrompt(
         ? `Review the current changes. Focus on these paths: ${opts.paths.trim()}. Read them and, if available, inspect the working-tree diff with git.`
         : `Review the current uncommitted changes in this repository (inspect the working-tree diff with git, e.g. \`git diff\`).`;
   return assemble(
-    CODEX,
+    advisor,
     host,
     `<task>\n${target}\n${opts.instructions ? `\nExtra focus: ${opts.instructions.trim()}\n` : ""}Find real correctness bugs, regressions, and gaps — not style nits.\n</task>`,
     `<structured_output_contract>\nReturn findings ordered by severity (blocker > major > minor). For each: file:line, what's wrong, why it matters, and the fix. If there are no real issues, say so plainly and note residual risk in one line. End with a one-line overall verdict.\n</structured_output_contract>`,
@@ -103,9 +104,9 @@ export function reviewDiffPrompt(
 }
 
 /** Open-ended co-design: generate alternative approaches to compare. */
-export function brainstormPrompt(host: string, problem: string, constraints?: string): string {
+export function brainstormPrompt(advisor: string, host: string, problem: string, constraints?: string): string {
   return assemble(
-    CODEX,
+    advisor,
     host,
     `<task>\nPropose and compare approaches for this problem so ${host} can pick well:\n\n<problem>\n${problem.trim()}\n</problem>\n</task>`,
     constraints && constraints.trim().length > 0 ? `<constraints>\n${constraints.trim()}\n</constraints>` : "",
@@ -126,13 +127,13 @@ export function replyPrompt(host: string, message: string): string {
 }
 
 /** Initial exploration: map an unfamiliar codebase. */
-export function explorePrompt(host: string, focus?: string, paths?: string): string {
+export function explorePrompt(advisor: string, host: string, focus?: string, paths?: string): string {
   const scope =
     focus && focus.trim().length > 0
       ? `Focus the exploration on: ${focus.trim()}.`
       : `Map the overall structure of this repository.`;
   return assemble(
-    CODEX,
+    advisor,
     host,
     `<task>\n${scope}${paths ? ` Start from: ${paths.trim()}.` : ""} Read the code to understand how it actually works — entry points, the main modules and how they fit together, key data types/flows, and notable conventions.\n</task>`,
     `<tool_persistence_rules>\nKeep reading until you can describe the system confidently. Don't stop after a partial read when one more targeted look would sharpen the map.\n</tool_persistence_rules>`,
@@ -212,6 +213,43 @@ export function magiAdvisorPrompt(opts: {
     opts.grokStrengths ? GROK_STRENGTHS_COUNCIL : "",
     DELIBERATION_ONLY,
     `<compact_output_contract>\nYour position in ≤4 sentences, then up to ~4 bullets of key reasoning, risks, or where you'd push back on the host. No preamble.\n</compact_output_contract>`,
+    GROUNDING,
+  );
+}
+
+/**
+ * A later deliberation round: the advisor sees every advisor's previous-round
+ * position and responds — engaging the others, updating where warranted, and
+ * ending with a CONSENSUS/OPEN verdict the council loop uses to detect when the
+ * debate has settled or stalled.
+ */
+export function magiDeliberatePrompt(opts: {
+  advisor: string;
+  host: string;
+  question: string;
+  context?: string;
+  hostTake?: string;
+  priorPositions: Array<{ name: string; text: string }>;
+  round: number;
+  maxRounds: number;
+  grokStrengths?: boolean;
+}): string {
+  const positions = opts.priorPositions
+    .map((p) => `### ${p.name}\n${p.text.trim() || "(no usable answer)"}`)
+    .join("\n\n");
+  const fellows = opts.priorPositions.map((p) => p.name).filter((n) => n !== opts.advisor);
+  return assemble(
+    opts.advisor,
+    opts.host,
+    magiFrame(opts.host, fellows),
+    `<deliberation_round>\nThis is round ${opts.round} of up to ${opts.maxRounds}. Below are every advisor's positions from the previous round (including your own). Engage the others directly: say where you agree, where you disagree and why, and update your own view if they've changed your mind. Converge if you honestly can; hold your ground with reasons if you can't.\n</deliberation_round>`,
+    `<question>\n${opts.question.trim()}\n</question>`,
+    withContext(opts.context),
+    opts.hostTake && opts.hostTake.trim().length > 0 ? `<host_position>\n${opts.hostTake.trim()}\n</host_position>` : "",
+    `<previous_round>\n${positions}\n</previous_round>`,
+    opts.grokStrengths ? GROK_STRENGTHS_COUNCIL : "",
+    DELIBERATION_ONLY,
+    `<output_contract>\nRespond in ≤4 sentences, then up to ~4 bullets engaging the other advisors. Then end with EXACTLY one final line, one of:\nVERDICT: CONSENSUS — <the one-sentence conclusion you now share with the council>\nVERDICT: OPEN — <the single most important point still unresolved>\n</output_contract>`,
     GROUNDING,
   );
 }

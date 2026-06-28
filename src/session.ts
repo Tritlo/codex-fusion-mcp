@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { isAbsolute, relative, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
   ClientSideConnection,
@@ -72,13 +73,15 @@ export interface AskOptions {
   /**
    * How to handle a guardian "ask" verdict for this turn. `"suspend"` (the
    * default) hands the decision back to Claude as a permission and pauses the
-   * turn until {@link AcpSession.permit}. `"deny"` auto-denies inline (logged
-   * like an auto-allow) so the turn never blocks — used by the magi council,
-   * which must complete as a single atomic call. Reads/searches inside the
-   * workspace are auto-allowed either way, and Grok's built-in web/X search
-   * doesn't go through this path at all, so deliberation still works.
+   * turn until {@link AcpSession.permit}. `"read-only"` resolves "ask" inline —
+   * auto-allowing reads/searches/think/fetch (so members can ground their answer,
+   * even outside the workspace) and auto-denying writes and command execution — so
+   * the turn never blocks. Used by the magi council, which must complete as a
+   * single atomic call but should still be able to read. Reads/searches inside the
+   * workspace are auto-allowed in every mode, and Grok's built-in web/X search
+   * doesn't go through this path at all.
    */
-  onAskPermission?: "suspend" | "deny";
+  onAskPermission?: "suspend" | "read-only";
 }
 
 /** A permission Codex raised mid-turn, awaiting Claude's allow/deny. */
@@ -145,9 +148,10 @@ export class AcpSession {
   private turnOnText?: (chunk: string) => void;
   private turnOnThought?: (chunk: string) => void;
   private turnOnActivity?: (note: string) => void;
-  // When true, a guardian "ask" verdict is auto-denied inline instead of
-  // suspending the turn (council/deliberation mode). Set per turn from AskOptions.
-  private turnAutoDenyAsk = false;
+  // When true, a guardian "ask" verdict is resolved inline (read-only council
+  // mode): reads/search/think/fetch allowed, writes/commands denied — never
+  // suspends. Set per turn from AskOptions.onAskPermission.
+  private turnReadOnly = false;
 
   // Event channel between the ACP callbacks and ask()/permit().
   private eventQueue: TurnEvent[] = [];
@@ -195,6 +199,13 @@ export class AcpSession {
     return wanted.map((kind) => options.find((o) => o.kind === kind)).find((o) => o !== undefined);
   }
 
+  /** True if reading `abs` is allowed: inside the workspace, or external reads enabled. */
+  private isReadable(abs: string): boolean {
+    if (this.config.allowExternalReads) return true;
+    const rel = relative(this.config.workspaceRoot, abs);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  }
+
   private buildClient(): Client {
     return {
       requestPermission: async (params): Promise<RequestPermissionResponse> => {
@@ -213,14 +224,19 @@ export class AcpSession {
             : { outcome: { outcome: "cancelled" } };
         }
 
-        // Council/deliberation turns never suspend: auto-deny inline and let the
-        // member continue without the action. Logged like an auto-allow so the
-        // council renderer can report what was blocked (ADR 0006).
-        if (this.turnAutoDenyAsk) {
-          const note = `auto-denied: ${label}${verdict.reason ? `  [${verdict.reason}]` : ""}`;
+        // Read-only council turns never suspend: resolve "ask" inline — allow
+        // reads/search/think/fetch (so the member can ground its answer), deny
+        // writes and command execution. Logged like an auto-allow so the council
+        // renderer can report what was blocked (ADR 0006/0008).
+        if (this.turnReadOnly) {
+          const kind = params.toolCall.kind ?? "other";
+          const readOnlyKind = kind === "read" || kind === "search" || kind === "think" || kind === "fetch";
+          const note = readOnlyKind
+            ? `auto-allowed: ${label} [read-only]`
+            : `auto-denied: ${label}${verdict.reason ? `  [${verdict.reason}]` : ""}`;
           this.turnLog.push(note);
           this.turnOnActivity?.(note);
-          const option = this.pickOption(params.options, false);
+          const option = this.pickOption(params.options, readOnlyKind);
           return option
             ? { outcome: { outcome: "selected", optionId: option.optionId } }
             : { outcome: { outcome: "cancelled" } };
@@ -242,6 +258,27 @@ export class AcpSession {
           };
           this.pushEvent({ kind: "permission", permission });
         });
+      },
+      readTextFile: async (params) => {
+        // Read-only client filesystem: serve reads scoped to the workspace (or
+        // anywhere when external reads are enabled). Never writes. This gives the
+        // member a non-shell read path that works even in read-only council mode.
+        if (params.sessionId !== this.sessionId) throw new Error("read for a superseded session");
+        const abs = resolve(params.path);
+        if (!this.isReadable(abs)) {
+          throw new Error(`read denied: ${params.path} is outside the workspace (set CODEX_FUSION_/MAGI_COUNCIL_ALLOW_EXTERNAL_READS to allow)`);
+        }
+        let content = readFileSync(abs, "utf8");
+        if (params.line != null || params.limit != null) {
+          const lines = content.split("\n");
+          const start = Math.max(0, (params.line ?? 1) - 1);
+          const end = params.limit != null ? start + params.limit : lines.length;
+          content = lines.slice(start, end).join("\n");
+        }
+        const note = `read: ${relative(this.config.workspaceRoot, abs) || abs}`;
+        this.turnLog.push(note);
+        this.turnOnActivity?.(note);
+        return { content };
       },
       sessionUpdate: async (params: SessionNotification): Promise<void> => {
         if (params.sessionId !== this.sessionId) return; // drop stale-session updates
@@ -317,7 +354,14 @@ export class AcpSession {
     this.conn = conn;
 
     try {
-      await conn.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+      // Advertise a read-only client filesystem so agents can read files through
+      // us (sandboxed to the workspace) instead of shelling out — the only way a
+      // command-reader like Codex can read in read-only council mode. We do NOT
+      // advertise writeTextFile: writes still go through the guardian.
+      await conn.initialize({
+        protocolVersion: PROTOCOL_VERSION,
+        clientCapabilities: { fs: { readTextFile: true, writeTextFile: false } },
+      });
       const session = await conn.newSession({ cwd: this.config.workspaceRoot, mcpServers: [] });
       // If startup was superseded (aborted/timed-out → forceReset, or a respawn)
       // while newSession was in flight, don't bind a session to a dead child.
@@ -480,7 +524,7 @@ export class AcpSession {
     await this.acquireGate();
     const id = ++this.turnId;
     this.turnLabel = opts.label ?? "turn";
-    this.turnAutoDenyAsk = opts.onAskPermission === "deny";
+    this.turnReadOnly = opts.onAskPermission === "read-only";
     this.turnText = "";
     this.turnLog = [];
     this.turnStart = Date.now();

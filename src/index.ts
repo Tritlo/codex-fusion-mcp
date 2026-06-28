@@ -21,6 +21,7 @@ import {
   explorePrompt,
   grokGeneratePrompt,
   magiAdvisorPrompt,
+  magiDeliberatePrompt,
   replyPrompt,
   reviewDiffPrompt,
   reviewPlanPrompt,
@@ -92,6 +93,16 @@ const hostName = (): string => {
   const e = resolveHost().excluded;
   return e ? specs[e].name : "the host agent";
 };
+
+/**
+ * Resolve which advisor a per-member deliberative tool targets: the requested
+ * member if active, else (when none requested) Codex, else the first active
+ * advisor. Returns undefined only when a specific inactive member was requested.
+ */
+function advisorFor(member: MemberId | undefined): MemberId | undefined {
+  if (member) return isActive(member) ? member : undefined;
+  return isActive("codex") ? "codex" : activeIds()[0];
+}
 
 const fmtTokens = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`);
 
@@ -227,14 +238,14 @@ const server = new McpServer({ name: "magi-council", version: "0.1.0" });
 // Tool handles per member, so the host's direct tools can be removed once known.
 const memberTools: Record<MemberId, Array<{ remove(): void }>> = { claude: [], codex: [], grok: [] };
 
-// --- Codex tools (the default primary advisor) ----------------------------
+// --- Codex tools ----------------------------------------------------------
 
 memberTools.codex.push(
   server.registerTool(
-    "consult",
+    "ask_codex",
     {
       description:
-        "Ask Codex (GPT-5) for an independent second opinion on a specific question or decision. Use to pressure-test a choice you're about to make. Codex debates back; continue with `reply` (cap ~3 turns).",
+        "Ask Codex (GPT-5) directly for an independent second opinion on a specific question or decision. Codex debates back; continue with `codex_reply` (cap ~3 turns). For the whole council use `consult`.",
       inputSchema: {
         question: z.string().describe("The specific question or decision to put to Codex."),
         context: z
@@ -246,97 +257,17 @@ memberTools.codex.push(
     },
     ({ question, context, time }, extra) =>
       isActive("codex")
-        ? ask("codex", consultPrompt(hostName(), question, context), extra, "consult", time)
+        ? ask("codex", consultPrompt(hostName(), question, context), extra, "ask_codex", time)
         : inactiveResult("codex"),
   ),
 );
 
 memberTools.codex.push(
   server.registerTool(
-    "review_plan",
+    "codex_reply",
     {
       description:
-        "Have Codex critique a plan or approach BEFORE you implement it — verdict, problems by severity, blind spots, and what to keep. Codex debates back; continue with `reply`.",
-      inputSchema: {
-        plan: z.string().describe("The plan/approach to review (steps, design, or intended changes)."),
-        context: z.string().optional().describe("Optional background or constraints."),
-        ...timeField,
-      },
-    },
-    ({ plan, context, time }, extra) =>
-      isActive("codex")
-        ? ask("codex", reviewPlanPrompt(hostName(), plan, context), extra, "review_plan", time)
-        : inactiveResult("codex"),
-  ),
-);
-
-memberTools.codex.push(
-  server.registerTool(
-    "review_diff",
-    {
-      description:
-        "Have Codex review code changes for correctness bugs and gaps. Pass a diff, or name paths and let Codex read the working tree (it may ask permission to run `git diff`). Codex debates back; continue with `reply`.",
-      inputSchema: {
-        diff: z.string().optional().describe("A unified diff to review. Omit to let Codex inspect `git diff` itself."),
-        paths: z.string().optional().describe("Paths to focus on (used when no diff is supplied)."),
-        instructions: z.string().optional().describe("Optional extra focus for the review."),
-        ...timeField,
-      },
-    },
-    ({ diff, paths, instructions, time }, extra) =>
-      isActive("codex")
-        ? ask("codex", reviewDiffPrompt(hostName(), { diff, paths, instructions }), extra, "review_diff", time)
-        : inactiveResult("codex"),
-  ),
-);
-
-memberTools.codex.push(
-  server.registerTool(
-    "brainstorm",
-    {
-      description:
-        "Co-design with Codex: get 2–4 alternative approaches with trade-offs and a recommendation, to compare against your own. Codex debates back; continue with `reply`.",
-      inputSchema: {
-        problem: z.string().describe("The design problem to explore."),
-        constraints: z.string().optional().describe("Optional constraints, requirements, or non-goals."),
-        ...timeField,
-      },
-    },
-    ({ problem, constraints, time }, extra) =>
-      isActive("codex")
-        ? ask("codex", brainstormPrompt(hostName(), problem, constraints), extra, "brainstorm", time)
-        : inactiveResult("codex"),
-  ),
-);
-
-memberTools.codex.push(
-  server.registerTool(
-    "explore",
-    {
-      description:
-        "Have Codex explore an unfamiliar codebase and report its structure, key components, data/control flow, and conventions. Good for initial orientation.",
-      inputSchema: {
-        focus: z
-          .string()
-          .optional()
-          .describe("What to focus the exploration on (a feature, subsystem, or question)."),
-        paths: z.string().optional().describe("Optional starting paths."),
-        ...timeField,
-      },
-    },
-    ({ focus, paths, time }, extra) =>
-      isActive("codex")
-        ? ask("codex", explorePrompt(hostName(), focus, paths), extra, "explore", time)
-        : inactiveResult("codex"),
-  ),
-);
-
-memberTools.codex.push(
-  server.registerTool(
-    "reply",
-    {
-      description:
-        "Continue the current debate with Codex: send a rebuttal or follow-up on the SAME session (it remembers the thread). Use to push back on Codex's last answer and drive toward consensus — keep the whole debate to ~3 turns.",
+        "Continue the conversation with Codex on the SAME session (it remembers the thread). Push back on its last answer and drive toward consensus — keep the whole debate to ~3 turns.",
       inputSchema: {
         message: z.string().describe("Your rebuttal, counter-point, or follow-up question for Codex."),
         ...timeField,
@@ -344,7 +275,7 @@ memberTools.codex.push(
     },
     ({ message, time }, extra) =>
       isActive("codex")
-        ? ask("codex", replyPrompt(hostName(), message), extra, "reply", time)
+        ? ask("codex", replyPrompt(hostName(), message), extra, "codex_reply", time)
         : inactiveResult("codex"),
   ),
 );
@@ -451,13 +382,112 @@ memberTools.grok.push(
   ),
 );
 
+// --- Deliberative tools (one advisor; default Codex) ----------------------
+// Structured single-advisor passes. They take an optional `member` (default
+// Codex, or the first active advisor if Codex is the host), so they work against
+// any council member — always registered, not tied to one member's host status.
+
+const memberField = {
+  member: z
+    .enum(["claude", "codex", "grok", "council"])
+    .optional()
+    .describe(
+      'Which advisor to ask: a specific member, or "council" to fan out to all active advisors (each gives an independent view). Defaults to Codex (or the first available advisor if Codex is the host).',
+    ),
+};
+
+server.registerTool(
+  "review_plan",
+  {
+    description:
+      "Have an advisor critique a plan or approach BEFORE you implement it — verdict, problems by severity, blind spots, and what to keep. Defaults to Codex; continue with that advisor's reply tool.",
+    inputSchema: {
+      plan: z.string().describe("The plan/approach to review (steps, design, or intended changes)."),
+      context: z.string().optional().describe("Optional background or constraints."),
+      ...memberField,
+      ...timeField,
+    },
+  },
+  ({ plan, context, member, time }, extra) => {
+    const build = (id: MemberId): string => reviewPlanPrompt(specs[id].promptName, hostName(), plan, context);
+    if (member === "council") return councilFanOut("review_plan", build, extra, time !== undefined ? time * 1000 : undefined);
+    const target = advisorFor(member);
+    if (!target) return inactiveResult(member!);
+    return ask(target, build(target), extra, "review_plan", time);
+  },
+);
+
+server.registerTool(
+  "review_diff",
+  {
+    description:
+      "Have an advisor review code changes for correctness bugs and gaps. Pass a diff, or name paths and let the advisor read the working tree (it may ask permission to run `git diff`). Defaults to Codex.",
+    inputSchema: {
+      diff: z.string().optional().describe("A unified diff to review. Omit to let the advisor inspect `git diff` itself."),
+      paths: z.string().optional().describe("Paths to focus on (used when no diff is supplied)."),
+      instructions: z.string().optional().describe("Optional extra focus for the review."),
+      ...memberField,
+      ...timeField,
+    },
+  },
+  ({ diff, paths, instructions, member, time }, extra) => {
+    const build = (id: MemberId): string => reviewDiffPrompt(specs[id].promptName, hostName(), { diff, paths, instructions });
+    if (member === "council") return councilFanOut("review_diff", build, extra, time !== undefined ? time * 1000 : undefined);
+    const target = advisorFor(member);
+    if (!target) return inactiveResult(member!);
+    return ask(target, build(target), extra, "review_diff", time);
+  },
+);
+
+server.registerTool(
+  "brainstorm",
+  {
+    description:
+      "Co-design with an advisor: get 2–4 alternative approaches with trade-offs and a recommendation, to compare against your own. Defaults to Codex.",
+    inputSchema: {
+      problem: z.string().describe("The design problem to explore."),
+      constraints: z.string().optional().describe("Optional constraints, requirements, or non-goals."),
+      ...memberField,
+      ...timeField,
+    },
+  },
+  ({ problem, constraints, member, time }, extra) => {
+    const build = (id: MemberId): string => brainstormPrompt(specs[id].promptName, hostName(), problem, constraints);
+    if (member === "council") return councilFanOut("brainstorm", build, extra, time !== undefined ? time * 1000 : undefined);
+    const target = advisorFor(member);
+    if (!target) return inactiveResult(member!);
+    return ask(target, build(target), extra, "brainstorm", time);
+  },
+);
+
+server.registerTool(
+  "explore",
+  {
+    description:
+      "Have an advisor explore an unfamiliar codebase and report its structure, key components, data/control flow, and conventions. Good for initial orientation. Defaults to Codex.",
+    inputSchema: {
+      focus: z.string().optional().describe("What to focus the exploration on (a feature, subsystem, or question)."),
+      paths: z.string().optional().describe("Optional starting paths."),
+      ...memberField,
+      ...timeField,
+    },
+  },
+  ({ focus, paths, member, time }, extra) => {
+    const build = (id: MemberId): string => explorePrompt(specs[id].promptName, hostName(), focus, paths);
+    if (member === "council") return councilFanOut("explore", build, extra, time !== undefined ? time * 1000 : undefined);
+    const target = advisorFor(member);
+    if (!target) return inactiveResult(member!);
+    return ask(target, build(target), extra, "explore", time);
+  },
+);
+
 // --- The Magi council -----------------------------------------------------
 
 server.registerTool(
-  "ask_magi",
+  "consult",
   {
     description:
-      "Convene the Magi council — your advisors (the council members other than you) each give an independent view on a question, and you synthesize. Every active advisor weighs in. Also: \"the council\". Follow up with the active members' reply tools (`reply`/`grok_reply`/`ask_claude`).",
+      "Consult the Magi council — every active advisor (the council members other than you) gives an independent view, and you synthesize. With `rounds` > 1 the advisors deliberate: round 1 is independent, then each sees the others' answers and rebuts/refines (each ends with a CONSENSUS/OPEN verdict). With `until_settled`, `rounds` is the max and it stops early once all advisors reach consensus or the debate stalls. For one specific advisor use `ask_codex`/`ask_grok`/`ask_claude`; for a structured single-advisor pass use `review_plan`/`review_diff`/`brainstorm`/`explore` (those take `member: \"council\"` to fan out one round to all).",
     inputSchema: {
       question: z.string().describe("The question or decision to put to the council."),
       context: z.string().optional().describe("Optional background or constraints."),
@@ -465,6 +495,21 @@ server.registerTool(
         .string()
         .optional()
         .describe("Your own current position, put before the council so the advisors can engage it directly."),
+      rounds: z
+        .number()
+        .int()
+        .min(1)
+        .max(8)
+        .optional()
+        .describe(
+          "Number of deliberation rounds (default 1 = independent panel, no cross-talk). 2+ makes the advisors hear and respond to each other. With `until_settled`, this is the max.",
+        ),
+      until_settled: z
+        .boolean()
+        .optional()
+        .describe(
+          "Treat `rounds` as a cap and stop early once all advisors reach CONSENSUS, or the debate stalls (verdicts stop changing). Default false.",
+        ),
       ...timeField,
     },
   },
@@ -475,6 +520,8 @@ interface MagiArgs {
   question: string;
   context?: string;
   my_take?: string;
+  rounds?: number;
+  until_settled?: boolean;
   time?: number;
 }
 
@@ -491,17 +538,21 @@ function renderVoice(name: string, result: AskResult | null): string {
 }
 
 /**
- * Run one Magi round: every active advisor answers the same question
- * independently, in member order. Sequential and atomic — each turn auto-denies
- * guardian "ask" so the whole council is one tool call. Each member is caught
- * independently so one failure still returns the others.
+ * Fan a task out to every active advisor, in member order, and render their
+ * voices for the host to synthesize. `buildPrompt(id)` produces each advisor's
+ * prompt. Sequential and atomic — each turn auto-denies guardian "ask" so the
+ * whole council is one tool call. Each member is caught independently so one
+ * failure still returns the others. (Advisors answer independently; they do not
+ * see each other's replies.)
  */
-async function runMagi(args: MagiArgs, extra: Extra): Promise<ToolResult> {
-  const { question, context, my_take, time } = args;
-  const timeoutMs = time !== undefined ? time * 1000 : undefined;
+async function councilFanOut(
+  label: string,
+  buildPrompt: (id: MemberId) => string,
+  extra: Extra,
+  timeoutMs: number | undefined,
+): Promise<ToolResult> {
   const host = hostName();
   const r = resolveHost();
-  const active = activeIds();
   const sections: string[] = [];
 
   if (r.source === "unknown") {
@@ -510,21 +561,15 @@ async function runMagi(args: MagiArgs, extra: Extra): Promise<ToolResult> {
     );
   }
 
-  for (const id of active) {
-    const fellowAdvisors = active.filter((x) => x !== id).map((x) => specs[x].name);
+  for (const id of activeIds()) {
     try {
-      const outcome = await sessions[id].ask(
-        magiAdvisorPrompt({
-          advisor: specs[id].promptName,
-          host,
-          question,
-          context,
-          hostTake: my_take,
-          fellowAdvisors,
-          grokStrengths: id === "grok",
-        }),
-        { label: "magi", signal: extra.signal, timeoutMs, onAskPermission: "deny", ...streamHooks(extra, `${specs[id].name} `) },
-      );
+      const outcome = await sessions[id].ask(buildPrompt(id), {
+        label,
+        signal: extra.signal,
+        timeoutMs,
+        onAskPermission: "read-only",
+        ...streamHooks(extra, `${specs[id].name} `),
+      });
       const result = outcome.type === "answer" ? outcome.result : null;
       sections.push(renderVoice(specs[id].name, result));
     } catch (err) {
@@ -532,8 +577,139 @@ async function runMagi(args: MagiArgs, extra: Extra): Promise<ToolResult> {
     }
   }
 
-  const synth = `_You (${host}) are the lead — weigh these voices and decide. Follow up with the active members' reply tools (\`reply\` / \`grok_reply\` / \`claude_reply\`)._`;
+  const synth = `_You (${host}) are the lead — weigh these voices and decide. Follow up with the active members' reply tools (\`codex_reply\` / \`grok_reply\` / \`claude_reply\`), or ask one directly (\`ask_codex\` / \`ask_grok\` / \`ask_claude\`)._`;
   return { content: [{ type: "text", text: [...sections, synth].join("\n\n---\n\n") }] };
+}
+
+/** Classify an advisor's VERDICT line, if present. */
+function verdictKind(text: string): "consensus" | "open" | null {
+  const m = text.match(/^[\s>*_-]*\**\s*VERDICT:\s*\**\s*(CONSENSUS|OPEN)\b/im);
+  return m ? (m[1]!.toUpperCase() === "CONSENSUS" ? "consensus" : "open") : null;
+}
+
+/** Normalized VERDICT line, for detecting a debate whose positions stopped moving. */
+function verdictSignature(text: string): string {
+  const m = text.match(/^.*VERDICT:.*$/im);
+  return (m ? m[0] : text.slice(-120)).replace(/[\s*_>-]+/g, " ").trim().toLowerCase();
+}
+
+/** True if two non-empty signature lists are the same multiset. */
+function sameMultiset(a: string[], b: string[]): boolean {
+  if (a.length === 0 || a.length !== b.length) return false;
+  const sa = [...a].sort();
+  const sb = [...b].sort();
+  return sa.every((v, i) => v === sb[i]);
+}
+
+/**
+ * Run the Magi council. `rounds` = 1 (default) is an independent panel (no
+ * cross-talk). `rounds` > 1 deliberates: round 1 independent, then each advisor
+ * sees the others' prior answers and responds with a CONSENSUS/OPEN verdict. With
+ * `until_settled`, `rounds` is the cap and the loop stops early once all advisors
+ * reach consensus or the debate stalls (verdicts stop changing).
+ */
+async function runMagi(args: MagiArgs, extra: Extra): Promise<ToolResult> {
+  const { question, context, my_take, time } = args;
+  const maxRounds = Math.max(1, Math.min(args.rounds ?? 1, 8));
+  const untilSettled = args.until_settled ?? false;
+  const timeoutMs = time !== undefined ? time * 1000 : undefined;
+  const host = hostName();
+
+  // Single-round panel — the common case, today's behavior.
+  if (maxRounds === 1) {
+    return councilFanOut(
+      "consult",
+      (id) =>
+        magiAdvisorPrompt({
+          advisor: specs[id].promptName,
+          host,
+          question,
+          context,
+          hostTake: my_take,
+          fellowAdvisors: activeIds().filter((x) => x !== id).map((x) => specs[x].name),
+          grokStrengths: id === "grok",
+        }),
+      extra,
+      timeoutMs,
+    );
+  }
+
+  const active = activeIds();
+  const blocks: string[] = [];
+  if (resolveHost().source === "unknown") {
+    blocks.push(
+      `⚠️ Host not recognized; all three members are participating, so one voice may be you. Set \`MAGI_COUNCIL_EXCLUDE=claude|codex|grok\` to exclude yourself.`,
+    );
+  }
+
+  let prev: Array<{ name: string; text: string }> = [];
+  let prevSig: string[] = [];
+  let outcome = "";
+
+  for (let round = 1; round <= maxRounds; round++) {
+    const cur: Array<{ name: string; text: string }> = [];
+    const voices: string[] = [];
+    for (const id of active) {
+      const prompt =
+        round === 1
+          ? magiAdvisorPrompt({
+              advisor: specs[id].promptName,
+              host,
+              question,
+              context,
+              hostTake: my_take,
+              fellowAdvisors: active.filter((x) => x !== id).map((x) => specs[x].name),
+              grokStrengths: id === "grok",
+            })
+          : magiDeliberatePrompt({
+              advisor: specs[id].promptName,
+              host,
+              question,
+              context,
+              hostTake: my_take,
+              priorPositions: prev,
+              round,
+              maxRounds,
+              grokStrengths: id === "grok",
+            });
+      try {
+        const o = await sessions[id].ask(prompt, {
+          label: "consult",
+          signal: extra.signal,
+          timeoutMs,
+          onAskPermission: "read-only",
+          ...streamHooks(extra, `${specs[id].name} R${round} `),
+        });
+        const result = o.type === "answer" ? o.result : null;
+        cur.push({ name: specs[id].name, text: result?.text ?? "" });
+        voices.push(renderVoice(specs[id].name, result));
+      } catch (err) {
+        cur.push({ name: specs[id].name, text: "" });
+        voices.push(`### ${specs[id].name}\n\n${renderMemberError(specs[id].name, err, specs[id].loginHint).content[0]!.text}`);
+      }
+    }
+    blocks.push(`## Round ${round}${round === 1 ? " — independent openings" : ""}\n\n${voices.join("\n\n---\n\n")}`);
+
+    const sig = cur.map((c) => verdictSignature(c.text));
+    if (untilSettled && round >= 2) {
+      if (cur.every((c) => verdictKind(c.text) === "consensus")) {
+        outcome = `✅ **Settled** — all advisors reached consensus after ${round} rounds.`;
+        break;
+      }
+      if (sameMultiset(sig, prevSig)) {
+        outcome = `⚖️ **Stalemate** — positions stopped changing after ${round} rounds.`;
+        break;
+      }
+    }
+    prevSig = sig;
+    prev = cur;
+    if (round === maxRounds) {
+      outcome = untilSettled ? `⏹️ Reached the ${maxRounds}-round cap without consensus.` : `Completed ${maxRounds} rounds.`;
+    }
+  }
+
+  const synth = `${outcome ? `${outcome}\n\n` : ""}_You (${host}) are the lead — weigh the debate and decide. Continue with the reply tools or another \`consult\`._`;
+  return { content: [{ type: "text", text: [...blocks, synth].join("\n\n---\n\n") }] };
 }
 
 // --- Shared session controls ----------------------------------------------

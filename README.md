@@ -25,46 +25,41 @@ keeping one persistent session per member per workspace.
 
 ## Tools
 
-A member's direct tools appear **only when that member isn't the host**. With the
-common Claude host you see Codex + Grok tools (and the Claude tools are hidden);
-with a Codex host you'd see Claude + Grok tools instead, and so on.
-
-**Codex** (the default primary advisor):
+**The council** — fans out to every advisor (the members other than you):
 
 | Tool | Use it to… |
 |------|-----------|
-| `consult` | get an independent second opinion on a specific question/decision |
-| `review_plan` | have Codex critique a plan **before** you implement it |
-| `review_diff` | have Codex review code changes (pass a diff, or let it read `git diff`) |
-| `brainstorm` | get 2–4 alternative approaches with trade-offs + a recommendation |
-| `explore` | map an unfamiliar codebase (structure, components, flow, conventions) |
-| `reply` | continue the debate — push back on Codex's last answer on the same session |
+| `consult` | convene the council on a question — each advisor gives an independent view, you synthesize. `rounds` > 1 makes them **deliberate** (hear and rebut each other); `until_settled` runs up to `rounds` and stops on consensus/stalemate |
 
-**Grok** (xAI):
+**Ask one advisor directly** (a member's pair appears only when it isn't the host):
 
 | Tool | Use it to… |
 |------|-----------|
-| `ask_grok` | ask Grok directly — second opinion with live web/X search, current events |
-| `grok_reply` | continue the conversation with Grok on the same session |
+| `ask_codex` / `codex_reply` | a second opinion from Codex (GPT-5), and follow-ups |
+| `ask_grok` / `grok_reply` | a second opinion from Grok — live web/X search, current events |
+| `ask_claude` / `claude_reply` | a second opinion from Claude (generalist coder) |
 | `grok_generate` | generate an image or short video with Grok, saved into the workspace |
 
-**Claude** (only when the host isn't Claude):
+**Structured single-advisor passes** — each takes an optional `member` (default Codex, or `"council"` to fan out to all):
 
 | Tool | Use it to… |
 |------|-----------|
-| `ask_claude` | ask Claude directly — an independent generalist-coder second opinion |
-| `claude_reply` | continue the conversation with Claude on the same session |
+| `review_plan` | critique a plan **before** you implement it (verdict / problems / blind spots) |
+| `review_diff` | review code changes (pass a diff, or let the advisor read `git diff`) |
+| `brainstorm` | get 2–4 alternative approaches with trade-offs + a recommendation |
+| `explore` | map an unfamiliar codebase (structure, components, flow, conventions) |
 
-**Council & shared:**
+**Shared:**
 
 | Tool | Use it to… |
 |------|-----------|
-| `ask_magi` | convene the council — every active advisor gives an independent view; you synthesize |
 | `permit` | allow/deny a permission a member raised mid-turn, then resume it (pass `member` if more than one is paused) |
 | `reset` | drop **all** members' accumulated context and start fresh sessions |
 | `status` | report the resolved host, the active council, and each active member's health |
 
-All tools are **advisory** — the members answer, you decide.
+All tools are **advisory** — the members answer, you decide. A member's direct
+tools (`ask_*`/`*_reply`) appear **only when that member isn't the host**; the
+council and the structured tools are always present and target the active members.
 
 ### Symmetric council & host detection
 
@@ -75,7 +70,7 @@ member** (the host), leaving the other two as the council. Resolution order:
 1. **`MAGI_COUNCIL_EXCLUDE`** (`claude`|`codex`|`grok`, startup only) — explicit, wins.
 2. **`clientInfo.name`** sent at `initialize` — matched against `claude`/`codex`/`grok`.
 3. **unknown** — if neither resolves, *all three* members participate (one may be
-   the host). `status` and `ask_magi` flag this, so an unrecognized host knows it
+   the host). `status` and `consult` flag this, so an unrecognized host knows it
    can set the env var to exclude itself.
 
 When the host is known, its direct tools are removed and every handler also guards
@@ -85,29 +80,42 @@ MCP config — see [Other agents](#giving-other-agents-the-council).
 
 ### Debate, not one-shot
 
-The deliberative tools (`consult`, `review_plan`, `review_diff`, `brainstorm`)
-frame each exchange as a short debate: the advisor pushes back, and ends every
-reply with a `VERDICT: CONSENSUS — …` or `VERDICT: OPEN — …` line. When it's
-`OPEN`, push back with `reply` (same persistent session, so the thread is kept)
-and drive toward consensus — keep it to ~3 turns.
+The single-advisor tools (`ask_codex`/`ask_grok`/`ask_claude`, `review_plan`,
+`review_diff`, `brainstorm`) frame each exchange as a short debate: the advisor
+pushes back, and ends every reply with a `VERDICT: CONSENSUS — …` or
+`VERDICT: OPEN — …` line. When it's `OPEN`, push back with that advisor's reply
+tool (same persistent session, so the thread is kept) and drive toward consensus —
+keep it to ~3 turns.
 
-### The Magi council (`ask_magi`)
+### The Magi council (`consult`)
 
-`ask_magi` convenes your advisors — the council members other than you — on one
-question, and you synthesize. **Every active advisor weighs in**, each giving an
-independent view (Grok leans on its live web/X search where it helps).
+`consult` convenes your advisors — the council members other than you — on one
+question, and you synthesize. **Every active advisor weighs in.** By default it's a
+one-round **panel**: each gives an *independent* view (no cross-talk; Grok leans on
+its live web/X search where it helps), and you do the reconciling.
 
-It runs members **sequentially** and **atomically** — a single tool call, no
-permit round-trips: a council turn auto-denies anything guardian would otherwise
-ask about, and surfaces a `⚠️ blocked in council mode: …` line so a grounded-looking
-answer can't hide a quietly-denied action. (Grok's web/X search isn't a guardian
-action, so it still works in-council.) Each member is handled independently, so if
-one is unavailable you still get the others. You're the lead: read the voices and
-decide, then follow up with the active members' reply tools.
+Pass **`rounds` > 1** to make them actually **deliberate**: round 1 is independent,
+then in each later round every advisor sees the others' prior answers and rebuts or
+refines, ending with a `VERDICT: CONSENSUS/OPEN` line. Add **`until_settled`** to
+treat `rounds` as a *max* and stop early once all advisors reach consensus, or once
+the debate **stalls** (verdicts stop changing) — the result is labelled *settled* /
+*stalemate* / *cap reached*.
 
-For actual **image/video generation** use `grok_generate` (it writes a file, which
-the council's auto-deny would block); the council is aware of the capability and
-will suggest it rather than do it.
+It runs members **sequentially** and **atomically** — a single tool call, no permit
+round-trips. A council turn is **read-only**: members may read any files and
+search/fetch to ground their answers, but writes and command execution are
+auto-denied (and surfaced as a `⚠️ blocked in council mode: …` line, so a
+grounded-looking answer can't hide a quietly-denied action). Grok's web/X search
+isn't a guardian action, so it works in-council too. Each member is handled
+independently, so if one is unavailable you still get the others.
+
+The structured tools (`review_plan`/`review_diff`/`brainstorm`/`explore`) also take
+**`member: "council"`** to fan out one round to every advisor (independent panel,
+no multi-round deliberation). Since council mode is read-only, a `member:"council"`
+`review_diff` can't run `git diff` (a command) — use single-advisor `review_diff`
+(which can, via a permit) for that. For **image/video generation** use
+`grok_generate` (it writes a file, which read-only council mode would block); the
+council is aware of the capability and will suggest it rather than do it.
 
 ### Permissions: the host is the guardian
 
@@ -124,7 +132,14 @@ All advisors share this guardian. Since each has its own session, **more than on
 can be paused at once** (e.g. a `consult` pauses Codex, then an `ask_grok` pauses
 Grok); `permit` takes an optional **`member`** (`claude`|`codex`|`grok`) — inferred
 when only one is pending, required when several are. (The Magi council never
-suspends — it auto-denies instead — so it never leaves a pending permit.)
+suspends — it runs read-only, resolving permissions inline — so it never leaves a
+pending permit.)
+
+The server also advertises a **read-only client filesystem** (ACP
+`fs/read_text_file`), sandboxed to the workspace (or anywhere with
+`MAGI_COUNCIL_ALLOW_EXTERNAL_READS`). This gives agents a non-shell read path — the
+reason a command-based reader like Codex can read inside read-only council mode at
+all. It never advertises `writeTextFile`, so writes still go through the guardian.
 
 ### Running out of usage
 
@@ -150,8 +165,9 @@ streaming is never cut off, however long it runs, and you keep its partial outpu
 instead of losing it. Pass a per-call `time` (seconds) to any tool to widen that
 idle window for a single big review/exploration. (The wait for a `permit`
 decision is **not** timed.) If your client caps tool calls more tightly, raise
-its timeout too — for Claude Code, `MCP_TOOL_TIMEOUT` (e.g. `600000`); `ask_magi`
-runs two turns back-to-back, so it benefits most from a generous cap.
+its timeout too — for Claude Code, `MCP_TOOL_TIMEOUT` (e.g. `600000`); `consult`
+runs every advisor back-to-back (and several rounds when deliberating), so it
+benefits most from a generous cap.
 The tool result stays focused on the member's answer plus a one-line footer
 (latency, tokens — Grok reports latency only); the full play-by-play goes to the
 debug log.
@@ -176,8 +192,8 @@ last one. `reset` clears **all** members. Two ways to clear it:
 
 Note the asymmetry: an advisor's context lives only as long as the server process,
 but the host's is persisted. After a host **resume**, a crash-respawn, or a reboot,
-advisors start empty while the host remembers — so a `reply` may land on an advisor
-that no longer has the thread. Re-establish context (or `reset` and start clean) if so.
+advisors start empty while the host remembers — so a follow-up reply may land on an
+advisor that no longer has the thread. Re-establish context (or `reset` and start clean) if so.
 
 ## Requirements
 
@@ -260,7 +276,7 @@ host's MCP server env:
 ```
 
 That host then gets Claude + Grok as its council (`ask_claude`, `ask_grok`,
-`ask_magi`). Check `status` to confirm the resolved host and active council.
+`consult`). Check `status` to confirm the resolved host and active council.
 
 ## Configuration (env)
 
