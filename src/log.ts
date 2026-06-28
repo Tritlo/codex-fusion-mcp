@@ -3,6 +3,8 @@ import type { Config } from "./config.ts";
 
 /** One turn's full detail, kept out of the tool result and sent here instead. */
 export interface TurnRecord {
+  /** Which member answered (Codex / Grok). */
+  member: string;
   /** Which tool drove the turn (consult, reply, …). */
   tool: string;
   /** Wall-clock duration of the turn in ms. */
@@ -24,9 +26,9 @@ export interface TurnRecord {
  * record as JSONL to {@link Config.logFile} when configured.
  */
 export function logTurn(config: Config, rec: TurnRecord): void {
-  const blocked = rec.activity.filter((a) => a.startsWith("denied")).length;
+  const blocked = rec.activity.filter((a) => a.startsWith("denied") || a.startsWith("auto-denied")).length;
   const summary =
-    `[codex-fusion] ${rec.tool} ${(rec.ms / 1000).toFixed(1)}s stop=${rec.stopReason}` +
+    `[magi-council] ${rec.member} ${rec.tool} ${(rec.ms / 1000).toFixed(1)}s stop=${rec.stopReason}` +
     (rec.totalTokens ? ` tok=${rec.totalTokens}` : "") +
     (blocked ? ` blocked=${blocked}` : "");
   process.stderr.write(`${summary}\n`);
@@ -35,7 +37,7 @@ export function logTurn(config: Config, rec: TurnRecord): void {
     try {
       appendFileSync(config.logFile, `${JSON.stringify({ at: new Date().toISOString(), ...rec })}\n`);
     } catch (err) {
-      process.stderr.write(`[codex-fusion] log write failed: ${(err as Error).message}\n`);
+      process.stderr.write(`[magi-council] log write failed: ${(err as Error).message}\n`);
     }
   }
 }

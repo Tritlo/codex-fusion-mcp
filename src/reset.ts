@@ -14,5 +14,5 @@ import { join } from "node:path";
  */
 export function resetNonceFile(workspaceRoot: string): string {
   const hash = createHash("sha256").update(workspaceRoot).digest("hex").slice(0, 16);
-  return join(tmpdir(), `codex-fusion-reset-${hash}`);
+  return join(tmpdir(), `magi-council-reset-${hash}`);
 }

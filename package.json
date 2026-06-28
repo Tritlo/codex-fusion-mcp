@@ -1,10 +1,10 @@
 {
-  "name": "codex-fusion-mcp",
+  "name": "magi-council-mcp",
   "version": "0.1.0",
-  "description": "MCP server that lets Claude consult Codex (via codex-acp) for review and co-planning — a lightweight fusion.",
+  "description": "MCP server that lets Claude convene a council of frontier models — Codex (codex-acp) and Grok (grok agent stdio) — for review, co-planning, and a three-way Magi deliberation.",
   "type": "module",
   "bin": {
-    "codex-fusion-mcp": "src/index.ts"
+    "magi-council-mcp": "src/index.ts"
   },
   "scripts": {
     "start": "bun run src/index.ts",
