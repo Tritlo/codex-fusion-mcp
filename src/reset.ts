@@ -7,7 +7,7 @@ import { join } from "node:path";
  *
  * The {@link https://docs.claude.com/en/docs/claude-code/hooks SessionStart}
  * hook writes the new Claude session id here on `/clear`; the server polls it and
- * drops Codex's session when it changes. Keyed by a hash of the workspace path so
+ * drops member sessions when it changes. Keyed by a hash of the workspace path so
  * independent projects don't reset each other, and kept in the OS temp dir so it
  * never pollutes the repo. Both the hook and the server import this one function,
  * so the path can't drift between them.

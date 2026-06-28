@@ -1,7 +1,7 @@
 {
   "name": "codex-fusion-mcp",
   "version": "0.1.0",
-  "description": "MCP server that lets Claude consult Codex (via codex-acp) for review and co-planning — a lightweight fusion.",
+  "description": "MCP server that lets Claude consult ACP-backed coding agents for review and co-planning — a lightweight fusion.",
   "type": "module",
   "bin": {
     "codex-fusion-mcp": "src/index.ts"

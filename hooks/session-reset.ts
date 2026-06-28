@@ -3,7 +3,7 @@
 //
 // On `/clear` (source === "clear"), write the new Claude session id to the
 // per-workspace nonce file the codex-fusion MCP server polls, so the server
-// drops Codex's stale context before the next consult. A no-op for startup,
+// drops stale council-member context before the next consult. A no-op for startup,
 // resume, and compact — those either coincide with a fresh server or are meant
 // to preserve continuity. Reuses src/reset.ts so the path matches the server's.
 import { renameSync, writeFileSync } from "node:fs";

@@ -2,7 +2,7 @@ import { isAbsolute, relative } from "node:path";
 import type { ToolCallUpdate, ToolKind } from "@agentclientprotocol/sdk";
 import type { Config } from "./config.ts";
 
-/** What guardian does with one of Codex's permission requests. */
+/** What guardian does with one of a member's permission requests. */
 export type Guard =
   | { decision: "allow"; reason: string } // auto-approved by policy, no round-trip
   | { decision: "ask"; reason: string }; // hand back to Claude to judge
@@ -17,7 +17,7 @@ function isInside(root: string, target: string): boolean {
  * Guardian policy: a pure function of the request and config.
  *
  * Auto-approve only the cheap, clearly-safe cases — reading and searching
- * *inside* the workspace — so Codex can explore without a round-trip per file.
+ * *inside* the workspace — so members can explore without a round-trip per file.
  * Everything else (commands, writes, network, out-of-workspace reads) is handed
  * back to Claude, which inspects the request and decides allow/deny. The
  * `allow*` flags downgrade a whole category from "ask" to "auto-allow" for users
@@ -64,7 +64,7 @@ export function guardianDecision(toolCall: ToolCallUpdate, config: Config): Guar
   }
 }
 
-/** A short, human-readable description of what Codex wants, for Claude to judge. */
+/** A short, human-readable description of what a member wants, for Claude to judge. */
 export function describePermission(toolCall: ToolCallUpdate): string {
   const kind = toolCall.kind ?? "action";
   const raw = toolCall.rawInput;

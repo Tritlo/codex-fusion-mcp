@@ -5,13 +5,14 @@ import {
   ClientSideConnection,
   ndJsonStream,
   PROTOCOL_VERSION,
+  type AuthMethod,
   type Client,
   type PermissionOption,
   type RequestPermissionResponse,
   type SessionNotification,
   type Usage,
 } from "@agentclientprotocol/sdk";
-import type { Config } from "./config.ts";
+import type { Config, CouncilMemberConfig } from "./config.ts";
 import { describePermission, guardianDecision } from "./permissions.ts";
 import { logTurn } from "./log.ts";
 import { resetNonceFile } from "./reset.ts";
@@ -20,7 +21,7 @@ import { resetNonceFile } from "./reset.ts";
 const HARD_STOP_GRACE_MS = 1500;
 
 /**
- * ACP `sessionUpdate` kinds that count as Codex making progress, and so reset the
+ * ACP `sessionUpdate` kinds that count as the agent making progress, and so reset the
  * idle timeout. Everything else (usage/mode/config/commands/session-info, and the
  * echoed user message) is housekeeping that must not keep a wedged turn alive.
  */
@@ -32,7 +33,7 @@ const LIVENESS_UPDATES = new Set<SessionNotification["update"]["sessionUpdate"]>
   "plan",
 ]);
 
-/** Thrown by {@link CodexSession.permit} when no turn is awaiting a decision. */
+/** Thrown by {@link AcpAgentSession.permit} when no turn is awaiting a decision. */
 export class NoPendingPermission extends Error {
   constructor() {
     super("no pending permission to decide");
@@ -40,17 +41,17 @@ export class NoPendingPermission extends Error {
   }
 }
 
-/** The outcome of one Codex prompt turn. */
+/** The outcome of one agent prompt turn. */
 export interface AskResult {
-  /** Codex's assembled final message. */
+  /** The agent's assembled final message. */
   text: string;
-  /** ACP stop reason (`end_turn` when Codex finished normally; also `timeout`/`cancelled`). */
+  /** ACP stop reason (`end_turn` when the agent finished normally; also `timeout`/`cancelled`). */
   stopReason: string;
   /** Guardian decisions and tool calls observed during the turn (full detail). */
   log: string[];
   /** Wall-clock duration of the turn in ms. */
   ms: number;
-  /** Token usage for the turn, when Codex reported it. */
+  /** Token usage for the turn, when the agent reported it. */
   usage?: Usage;
 }
 
@@ -60,9 +61,9 @@ export interface AskOptions {
   label?: string;
   /** Aborts the turn (e.g. the user cancels); triggers an ACP `session/cancel`. */
   signal?: AbortSignal;
-  /** Called with each chunk of Codex's reply as it streams in. */
+  /** Called with each chunk of the agent's reply as it streams in. */
   onText?: (chunk: string) => void;
-  /** Called with each chunk of Codex's reasoning, for a live "thinking" view. Also
+  /** Called with each chunk of the agent's reasoning, for a live "thinking" view. Also
    * the heartbeat that keeps the MCP request alive during long silent reasoning. */
   onThought?: (chunk: string) => void;
   /** Called with each guardian decision / tool call, for a live activity view. */
@@ -71,17 +72,17 @@ export interface AskOptions {
   timeoutMs?: number;
 }
 
-/** A permission Codex raised mid-turn, awaiting Claude's allow/deny. */
+/** A permission an agent raised mid-turn, awaiting Claude's allow/deny. */
 interface PendingPermission {
-  /** What Codex wants to do, for Claude to judge. */
+  /** What the agent wants to do, for Claude to judge. */
   description: string;
   /** Resolve the held-open ACP request with Claude's decision. */
   decide: (allow: boolean) => void;
 }
 
 /**
- * What {@link CodexSession.ask}/{@link CodexSession.permit} return: either
- * Codex's answer, or a permission request handed back for Claude to judge.
+ * What {@link AcpAgentSession.ask}/{@link AcpAgentSession.permit} return: either
+ * the agent's answer, or a permission request handed back for Claude to judge.
  */
 export type TurnOutcome =
   | { type: "answer"; result: AskResult }
@@ -93,8 +94,10 @@ type TurnEvent =
   | { kind: "done"; result: AskResult }
   | { kind: "failed"; error: Error };
 
-/** A point-in-time health snapshot of the Codex session. */
+/** A point-in-time health snapshot of an ACP agent session. */
 export interface SessionStatus {
+  memberName: string;
+  displayName: string;
   workspaceRoot: string;
   acpCommand: string;
   guardian: { externalReads: boolean; writes: boolean; commands: boolean };
@@ -106,17 +109,18 @@ export interface SessionStatus {
 }
 
 /**
- * A long-lived ACP client over a spawned `codex-acp` process.
+ * A long-lived ACP client over a spawned coding-agent process.
  *
  * One session is created lazily on first use and reused for every tool call, so
- * Codex accumulates context across the conversation (the "persistent session"
+ * each council member accumulates context across the conversation (the "persistent session"
  * fusion model). Turns are serialized behind a gate. A turn can pause mid-flight
- * when Codex requests a permission guardian doesn't auto-allow: {@link ask}
+ * when the agent requests a permission guardian doesn't auto-allow: {@link ask}
  * returns a {@link TurnOutcome} of `permission`, and {@link permit} resumes the
  * same suspended turn once Claude has decided.
  */
-export class CodexSession {
+export class AcpAgentSession {
   private readonly config: Config;
+  private readonly member: CouncilMemberConfig;
   private child?: ChildProcess;
   private conn?: ClientSideConnection;
   private sessionId?: string;
@@ -137,7 +141,7 @@ export class CodexSession {
   private eventWaiter?: (e: TurnEvent) => void;
   private awaitingDecision?: PendingPermission;
   // Set by the active drive() segment; the ACP sessionUpdate callback calls it on
-  // every chunk so the idle timeout is measured from Codex's *last* output.
+  // every chunk so the idle timeout is measured from the agent's *last* output.
   private bumpIdle?: () => void;
 
   // Serializes turns; the holder releases it when the turn fully ends.
@@ -147,11 +151,12 @@ export class CodexSession {
   // background prompt, or a superseded segment) can't mutate a newer turn.
   private turnId = 0;
   // Last-seen reset nonce; a *change* (the SessionStart hook wrote a new Claude
-  // session id on /clear) drops Codex's context on the next turn.
+  // session id on /clear) drops each member's context on the next turn.
   private lastNonce?: string;
 
-  constructor(config: Config) {
+  constructor(config: Config, member: CouncilMemberConfig) {
     this.config = config;
+    this.member = member;
     this.lastNonce = this.readResetNonce(); // baseline — only a later change resets
   }
 
@@ -212,10 +217,10 @@ export class CodexSession {
             }
             break;
           case "agent_thought_chunk":
-            // Codex's reasoning. Forward only as a live view / heartbeat — emitting
+            // The agent's reasoning. Forward only as a live view / heartbeat — emitting
             // progress keeps the MCP request alive through long silent thinking
             // (the client resets its timeout on progress). Never fold it into
-            // turnText, which must stay Codex's final answer.
+            // turnText, which must stay the agent's final answer.
             if (u.content.type === "text") this.turnOnThought?.(u.content.text);
             break;
           case "tool_call": {
@@ -231,9 +236,48 @@ export class CodexSession {
     };
   }
 
+  private authMethodType(method: AuthMethod): string {
+    return "type" in method ? method.type : "agent";
+  }
+
+  private authMethodUsable(method: AuthMethod): boolean {
+    const type = this.authMethodType(method);
+    if (type === "terminal") return false;
+    if (type !== "env_var" || !("vars" in method)) return true;
+    return method.vars.every((v) => v.optional || process.env[v.name] !== undefined);
+  }
+
+  private pickAuthMethod(methods: AuthMethod[]): AuthMethod | undefined {
+    for (const id of this.member.authMethods) {
+      const method = methods.find((m) => m.id === id);
+      if (method && this.authMethodUsable(method)) return method;
+    }
+    const envReady = methods.find((method) => this.authMethodType(method) === "env_var" && this.authMethodUsable(method));
+    if (envReady) return envReady;
+    const agentHandled = methods.find((method) => this.authMethodType(method) === "agent");
+    if (agentHandled) return agentHandled;
+    return methods.find((method) => this.authMethodUsable(method));
+  }
+
+  private async authenticateIfNeeded(
+    conn: ClientSideConnection,
+    methods: AuthMethod[] | undefined,
+  ): Promise<void> {
+    if (!methods || methods.length === 0) return;
+    const method = this.pickAuthMethod(methods);
+    if (!method) {
+      const available = methods.map((m) => `${m.id} (${this.authMethodType(m)})`).join(", ");
+      throw new Error(
+        `${this.member.displayName} requires ACP authentication, but no non-interactive method was usable. ` +
+          `Available methods: ${available}. ${this.member.authHint}.`,
+      );
+    }
+    await conn.authenticate({ methodId: method.id, _meta: { headless: true } });
+  }
+
   private async start(): Promise<void> {
-    const [cmd, ...args] = this.config.acpCommand;
-    if (!cmd) throw new Error("CODEX_FUSION_ACP_COMMAND is empty");
+    const [cmd, ...args] = this.member.acpCommand;
+    if (!cmd) throw new Error(`${this.member.name} ACP command is empty`);
 
     const child = spawn(cmd, args, {
       cwd: this.config.workspaceRoot,
@@ -245,9 +289,9 @@ export class CodexSession {
       this.stderr.push(d.toString());
       if (this.stderr.length > 50) this.stderr.shift();
     });
-    // If codex-acp dies, drop the session so the next turn respawns it.
+    // If the ACP child dies, drop the session so the next turn respawns it.
     child.on("exit", (code, signal) => {
-      this.stderr.push(`codex-acp exited (code=${code} signal=${signal})`);
+      this.stderr.push(`${this.member.name} ACP exited (code=${code} signal=${signal})`);
       if (this.child === child) {
         this.child = undefined;
         this.conn = undefined;
@@ -255,7 +299,7 @@ export class CodexSession {
         this.starting = undefined;
       }
     });
-    if (!child.stdin || !child.stdout) throw new Error("codex-acp: no stdio pipes");
+    if (!child.stdin || !child.stdout) throw new Error(`${this.member.name} ACP: no stdio pipes`);
 
     const stream = ndJsonStream(
       Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
@@ -265,11 +309,12 @@ export class CodexSession {
     this.conn = conn;
 
     try {
-      await conn.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+      const init = await conn.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+      await this.authenticateIfNeeded(conn, init.authMethods);
       const session = await conn.newSession({ cwd: this.config.workspaceRoot, mcpServers: [] });
       // If startup was superseded (aborted/timed-out → forceReset, or a respawn)
       // while newSession was in flight, don't bind a session to a dead child.
-      if (this.child !== child) throw new Error("codex-acp startup superseded");
+      if (this.child !== child) throw new Error(`${this.member.name} ACP startup superseded`);
       this.sessionId = session.sessionId;
     } catch (err) {
       const tail = this.stderr.join("").trim().slice(-600);
@@ -281,9 +326,9 @@ export class CodexSession {
       }
       child.kill();
       throw new Error(
-        `codex-acp failed to start a session: ${(err as Error).message}` +
-          (tail ? `\n\ncodex-acp stderr:\n${tail}` : "") +
-          `\n\nIf this is an auth problem, run \`/codex:setup\` or \`codex login\`.`,
+        `${this.member.displayName} ACP failed to start a session: ${(err as Error).message}` +
+          (tail ? `\n\n${this.member.name} ACP stderr:\n${tail}` : "") +
+          `\n\nIf this is an auth problem, ${this.member.authHint}.`,
       );
     }
   }
@@ -317,7 +362,7 @@ export class CodexSession {
       const timer = setTimeout(() => {
         cleanup();
         this.forceReset();
-        reject(new Error(`codex-acp startup timed out after ${limit}ms`));
+        reject(new Error(`${this.member.name} ACP startup timed out after ${limit}ms`));
       }, limit);
       const onAbort = (): void => {
         cleanup();
@@ -394,7 +439,7 @@ export class CodexSession {
       usage,
     };
     logTurn(this.config, {
-      tool: this.turnLabel,
+      tool: `${this.member.name}/${this.turnLabel}`,
       ms: result.ms,
       stopReason,
       totalTokens: usage?.totalTokens,
@@ -417,9 +462,9 @@ export class CodexSession {
     );
   }
 
-  /** Start a new prompt turn. Returns Codex's answer or a permission to judge. */
+  /** Start a new prompt turn. Returns the agent's answer or a permission to judge. */
   async ask(prompt: string, opts: AskOptions = {}): Promise<TurnOutcome> {
-    this.checkSessionEpoch(); // a new Claude session (/clear) drops Codex's stale context
+    this.checkSessionEpoch(); // a new Claude session (/clear) drops stale member context
     // A prior turn suspended awaiting a decision Claude never made — abandon it.
     // Key on awaitingDecision (the suspended marker), not releaseGate, which is
     // set for every in-flight turn and would wrongly abandon a running one.
@@ -475,7 +520,7 @@ export class CodexSession {
     opts.signal?.addEventListener("abort", onExternalAbort, { once: true });
     if (opts.signal?.aborted) ctrl.abort(); // listener won't fire for an already-aborted signal
 
-    // Idle timeout, measured from Codex's *last* output: bumpIdle (called from the
+    // Idle timeout, measured from the agent's *last* output: bumpIdle (called from the
     // sessionUpdate callback on every chunk) pushes lastActivity forward, and the
     // timer re-arms for the remaining window instead of firing. An actively-
     // streaming turn is therefore never cut off — only true silence aborts, so a
@@ -501,7 +546,7 @@ export class CodexSession {
     };
     timer = setTimeout(armIdle, timeoutMs);
 
-    // On abort, ask codex-acp to cancel, then arm a hard stop: ACP cancel is only
+    // On abort, ask the ACP agent to cancel, then arm a hard stop: ACP cancel is only
     // a notification, so a wedged agent could otherwise keep the turn pending.
     let hardStop = false;
     const abandoned = new Promise<never>((_, reject) => {
@@ -593,7 +638,7 @@ export class CodexSession {
   }
 
   /**
-   * Drop the Codex session and preempt any in-flight or suspended turn, so the
+   * Drop the agent session and preempt any in-flight or suspended turn, so the
    * next turn starts a brand-new session. Idempotent and safe with no active
    * turn. Backs both the manual `reset` tool and auto-reset on a new Claude
    * session. Must run *before* {@link acquireGate}: a suspended turn deliberately
@@ -625,8 +670,10 @@ export class CodexSession {
   status(): SessionStatus {
     const child = this.child;
     return {
+      memberName: this.member.name,
+      displayName: this.member.displayName,
       workspaceRoot: this.config.workspaceRoot,
-      acpCommand: this.config.acpCommand.join(" "),
+      acpCommand: this.member.acpCommand.join(" "),
       guardian: {
         externalReads: this.config.allowExternalReads,
         writes: this.config.allowWrites,
@@ -639,7 +686,7 @@ export class CodexSession {
     };
   }
 
-  /** Terminate the codex-acp subprocess. */
+  /** Terminate the ACP subprocess. */
   dispose(): void {
     this.child?.kill();
   }

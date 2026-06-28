@@ -1,14 +1,16 @@
 /**
  * Prompt builders for each fusion tool.
  *
- * Codex (GPT-5.x) responds best to compact, block-structured prompts with
+ * Coding agents tend to behave best with compact, block-structured prompts with
  * stable XML tags: one task, an explicit output contract, and only the
  * grounding/verification blocks the task needs. These templates follow the
- * Codex prompting recipes and the GPT-5.2 prompting guide (default to tight
+ * Codex prompting recipes and the GPT-5.2 prompting guide as a baseline (default to tight
  * output, ground claims, label hypotheses, no speculative scope).
  */
 
-const PREAMBLE = `You are GPT-5/Codex acting as an independent peer reviewer and co-planner for Claude, another AI coding agent working in this repository. Give a candid, technically specific second opinion. You can read the workspace to ground your answer. Disagree when warranted — your value is catching what Claude missed, not agreeing.`;
+function preamble(agentName: string): string {
+  return `You are ${agentName} acting as an independent peer reviewer and co-planner for Claude, another AI coding agent working in this repository. Give a candid, technically specific second opinion. You can read the workspace to ground your answer. Disagree when warranted — your value is catching what Claude missed, not agreeing.`;
+}
 
 const GROUNDING = `<grounding_rules>
 Ground every claim in the repository or your own tool output. Do not present inferences as facts; label hypotheses as such. Prefer "based on <file>" over generic assertions.
@@ -25,8 +27,8 @@ VERDICT: CONSENSUS — <the agreed conclusion in one sentence>
 VERDICT: OPEN — <the single most important point still unresolved>
 </debate>`;
 
-function assemble(...blocks: string[]): string {
-  return [PREAMBLE, ...blocks].join("\n\n");
+function assemble(agentName: string, ...blocks: string[]): string {
+  return [preamble(agentName), ...blocks].join("\n\n");
 }
 
 function withContext(context: string | undefined): string {
@@ -36,8 +38,9 @@ function withContext(context: string | undefined): string {
 }
 
 /** A focused question / second opinion on a specific decision. */
-export function consultPrompt(question: string, context?: string): string {
+export function consultPrompt(agentName: string, question: string, context?: string): string {
   return assemble(
+    agentName,
     `<task>\n${question.trim()}\n</task>`,
     withContext(context),
     `<compact_output_contract>\nAnswer directly first (≤3 sentences), then the key reasoning as a few bullets. If Claude's framing has a wrong assumption, say so up front. No preamble or recap.\n</compact_output_contract>`,
@@ -48,8 +51,9 @@ export function consultPrompt(question: string, context?: string): string {
 }
 
 /** Critique a plan/approach before Claude implements it. */
-export function reviewPlanPrompt(plan: string, context?: string): string {
+export function reviewPlanPrompt(agentName: string, plan: string, context?: string): string {
   return assemble(
+    agentName,
     `<task>\nReview this plan that Claude intends to implement. Judge whether it is correct, complete, and the simplest approach that works.\n\n<plan>\n${plan.trim()}\n</plan>\n</task>`,
     withContext(context),
     `<structured_output_contract>\nReturn, highest-impact first:\n1. Verdict — sound / sound with changes / reconsider.\n2. Problems — concrete issues, each with why it matters and a fix. Ordered by severity.\n3. Blind spots — edge cases, failure modes, or simpler alternatives the plan ignores.\n4. Agreements — parts that are right (brief), so Claude knows what to keep.\nBe specific; skip generic advice.\n</structured_output_contract>`,
@@ -60,13 +64,17 @@ export function reviewPlanPrompt(plan: string, context?: string): string {
 }
 
 /** Review concrete code changes (a diff or named paths). */
-export function reviewDiffPrompt(opts: { diff?: string; paths?: string; instructions?: string }): string {
+export function reviewDiffPrompt(
+  agentName: string,
+  opts: { diff?: string; paths?: string; instructions?: string },
+): string {
   const target = opts.diff && opts.diff.trim().length > 0
     ? `Review the following diff:\n\n<diff>\n${opts.diff.trim()}\n</diff>`
     : opts.paths && opts.paths.trim().length > 0
       ? `Review the current changes. Focus on these paths: ${opts.paths.trim()}. Read them and, if available, inspect the working-tree diff with git.`
       : `Review the current uncommitted changes in this repository (inspect the working-tree diff with git, e.g. \`git diff\`).`;
   return assemble(
+    agentName,
     `<task>\n${target}\n${opts.instructions ? `\nExtra focus: ${opts.instructions.trim()}\n` : ""}Find real correctness bugs, regressions, and gaps — not style nits.\n</task>`,
     `<structured_output_contract>\nReturn findings ordered by severity (blocker > major > minor). For each: file:line, what's wrong, why it matters, and the fix. If there are no real issues, say so plainly and note residual risk in one line. End with a one-line overall verdict.\n</structured_output_contract>`,
     `<dig_deeper_nudge>\nBeyond the obvious: empty-state and error paths, off-by-one and boundary conditions, stale/duplicated state, missing cleanup, and behavior changes that break callers.\n</dig_deeper_nudge>`,
@@ -77,8 +85,9 @@ export function reviewDiffPrompt(opts: { diff?: string; paths?: string; instruct
 }
 
 /** Open-ended co-design: generate alternative approaches to compare. */
-export function brainstormPrompt(problem: string, constraints?: string): string {
+export function brainstormPrompt(agentName: string, problem: string, constraints?: string): string {
   return assemble(
+    agentName,
     `<task>\nPropose and compare approaches for this problem so Claude can pick well:\n\n<problem>\n${problem.trim()}\n</problem>\n</task>`,
     constraints && constraints.trim().length > 0
       ? `<constraints>\n${constraints.trim()}\n</constraints>`
@@ -100,11 +109,12 @@ export function replyPrompt(message: string): string {
 }
 
 /** Initial exploration: map an unfamiliar codebase. */
-export function explorePrompt(focus?: string, paths?: string): string {
+export function explorePrompt(agentName: string, focus?: string, paths?: string): string {
   const scope = focus && focus.trim().length > 0
     ? `Focus the exploration on: ${focus.trim()}.`
     : `Map the overall structure of this repository.`;
   return assemble(
+    agentName,
     `<task>\n${scope}${paths ? ` Start from: ${paths.trim()}.` : ""} Read the code to understand how it actually works — entry points, the main modules and how they fit together, key data types/flows, and notable conventions.\n</task>`,
     `<tool_persistence_rules>\nKeep reading until you can describe the system confidently. Don't stop after a partial read when one more targeted look would sharpen the map.\n</tool_persistence_rules>`,
     `<research_mode>\nBreadth first (the shape of the whole), then depth on the parts that matter for the focus. Separate what you observed from what you're inferring.\n</research_mode>`,

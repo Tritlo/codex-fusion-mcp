@@ -9,17 +9,17 @@ export interface TurnRecord {
   ms: number;
   /** ACP stop reason (or `timeout`/`cancelled`). */
   stopReason: string;
-  /** Total tokens for the turn, when Codex reported usage. */
+  /** Total tokens for the turn, when the member reported usage. */
   totalTokens?: number;
   /** Every guardian decision and tool call observed during the turn. */
   activity: string[];
-  /** Codex's final text (only persisted to the file sink). */
+  /** Member's final text (only persisted to the file sink). */
   text: string;
 }
 
 /**
  * Record a finished turn for debugging. The tool result stays focused on
- * Codex's answer; the full play-by-play lands here instead: a one-line summary
+ * the member's answer; the full play-by-play lands here instead: a one-line summary
  * to stderr always (captured in Claude Code's MCP logs), and the complete
  * record as JSONL to {@link Config.logFile} when configured.
  */
