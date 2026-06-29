@@ -29,7 +29,7 @@ keeping one persistent session per member per workspace.
 
 | Tool | Use it to… |
 |------|-----------|
-| `consult` | convene the council on a question — each advisor gives an independent view, you synthesize. `rounds` > 1 makes them **deliberate** (hear and rebut each other); `until_settled` runs up to `rounds` and stops on consensus/stalemate |
+| `consult` | convene the council on a question — each advisor gives an independent view, you synthesize. `rounds` > 1 makes them **deliberate** (hear and rebut each other); `until_settled` runs up to `rounds` and stops on consensus/stalemate; `fresh` runs each advisor on a throwaway session (no cross-call context) |
 
 **Ask one advisor directly** (a member's pair appears only when it isn't the host):
 
@@ -96,13 +96,24 @@ its live web/X search where it helps), and you do the reconciling.
 
 Pass **`rounds` > 1** to make them actually **deliberate**: round 1 is independent,
 then in each later round every advisor sees the others' prior answers and rebuts or
-refines, ending with a `VERDICT: CONSENSUS/OPEN` line. Add **`until_settled`** to
-treat `rounds` as a *max* and stop early once all advisors reach consensus, or once
-the debate **stalls** (verdicts stop changing) — the result is labelled *settled* /
-*stalemate* / *cap reached*.
+refines, ending each reply with a `CHANGED: yes/no` line and a `VERDICT:
+CONSENSUS/OPEN` line. Add **`until_settled`** to treat `rounds` as a *max* and stop
+early once **all (answering) advisors reach consensus**, or once **no advisor's
+position moves** in a round — the result is labelled *settled* / *stalemate* / *cap
+reached*. Convergence is the advisors' own self-report, not a string-compare, and an
+advisor that errored or returned nothing is excluded so it can't fake a stalemate
+(ADR 0010).
 
-It runs members **sequentially** and **atomically** — a single tool call, no permit
-round-trips. A council turn is **read-only**: members may read any files and
+Pass **`fresh`** to run each advisor on a **throwaway session** — independent of any
+prior conversation and discarded when the consult ends — so the council's votes
+don't carry or leave cross-call context. It's slower (each advisor spawns fresh) and
+forfeits the accumulated "collaborator" memory, so it's opt-in; the default reuses
+the persistent sessions. (`fresh` is the lightweight end of the council-memory
+trade-off; the durable other end is the proposed `MAGI.md`, ADR 0011.)
+
+It runs members **concurrently** and **atomically** — every advisor's turn fans out
+at once (each on its own session), rendered back in member order, as a single tool
+call with no permit round-trips. A council turn is **read-only**: members may read any files and
 search/fetch to ground their answers, but writes and command execution are
 auto-denied (and surfaced as a `⚠️ blocked in council mode: …` line, so a
 grounded-looking answer can't hide a quietly-denied action). Grok's web/X search
@@ -311,11 +322,27 @@ in [`src/permissions.ts`](src/permissions.ts).
 ```
 src/config.ts       env → Config + 3 per-member MemberSpecs + host-exclude override
 src/permissions.ts  guardianDecision — the pure permission policy
+src/council.ts      pure deliberation logic: parse verdicts + decide settlement
 src/prompts.ts      host-parameterized prompts per tool (Codex/Grok/Claude, magi, generate)
 src/session.ts      AcpSession — ACP client: spawn a member, persistent session, streaming ask()
 src/reset.ts        per-workspace reset-nonce path (shared by server + hook)
 src/log.ts          per-turn debug log (stderr summary + optional JSONL file)
 src/index.ts        MCP server: 3 member sessions, host detection + tool gating, the Magi council
 hooks/session-reset.ts  SessionStart hook: reset members on the host's /clear (Claude Code)
+test/fake-acp.ts    a scripted ACP agent subprocess for tests (behavior by --scenario)
+test/*.test.ts      bun test: AcpSession lifecycle (E2E vs the fake) + pure council logic
 docs/adr/000*.md    design decisions
 ```
+
+## Tests
+
+```bash
+bun test       # ~3s, deterministic, no network and no real model calls
+bun run typecheck
+```
+
+`test/session.test.ts` drives `AcpSession` end-to-end against `test/fake-acp.ts` — a
+real ACP *agent* subprocess scripted by `--scenario` — through the genuine
+spawn → prompt → permission → cancel path, covering suspend/resume, reset, idle
+timeout, external cancel, crash-fails-fast, gate serialization, and nonce reset.
+`test/council.test.ts` unit-tests the pure convergence logic in `src/council.ts`.

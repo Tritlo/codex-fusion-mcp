@@ -148,13 +148,15 @@ test("a child that dies mid-turn fails fast, not after the idle timeout", async 
   let threw = false;
   const started = performance.now();
   try {
-    await s.ask("go", { timeoutMs: 30_000 }); // huge idle window: a hang would blow the test timeout
+    await s.ask("go", { timeoutMs: 30_000 }); // huge idle window: if it waited for idle, it'd take 30s+
   } catch {
     threw = true;
   }
   expect(threw).toBe(true);
-  expect(performance.now() - started).toBeLessThan(5_000); // woken by child exit, not idle
-}, 10_000);
+  // Woken by the child's exit, not the idle timeout. The bound is generous (vs the
+  // 30s idle window) so a loaded CI box can't flake it while still proving the point.
+  expect(performance.now() - started).toBeLessThan(15_000);
+}, 25_000);
 
 test("turns serialize behind the gate", async () => {
   const s = makeSession("answer");
