@@ -29,7 +29,7 @@ keeping one persistent session per member per workspace.
 
 | Tool | Use it to… |
 |------|-----------|
-| `consult` | convene the council on a question — each advisor gives an independent view, you synthesize. `rounds` > 1 makes them **deliberate** (hear and rebut each other); `until_settled` runs up to `rounds` and stops on consensus/stalemate; `fresh` runs each advisor on a throwaway session (no cross-call context) |
+| `consult` | convene the council on a question — each advisor gives an independent view, you synthesize. **Deliberation is host-mediated**: it returns one round; weigh in (`my_take`) and **call again** to run the next round, iterating until you judge agreement. `members` picks who sits on the council (a subset); `fresh` runs each advisor on a throwaway session (no cross-call context) |
 
 **Ask one advisor directly** (a member's pair appears only when it isn't the host):
 
@@ -90,20 +90,22 @@ keep it to ~3 turns.
 ### The Magi council (`consult`)
 
 `consult` convenes your advisors — the council members other than you — on one
-question, and you synthesize. **Every active advisor weighs in.** By default it's a
-one-round **panel**: each gives an *independent* view (no cross-talk; Grok leans on
-its live web/X search where it helps), and you do the reconciling.
+question. **Every active advisor weighs in** with an *independent* view (no cross-talk;
+Grok leans on its live web/X search where it helps), and you synthesize.
 
-Pass **`rounds` > 1** to make them actually **deliberate**: round 1 is independent,
-then in each later round every advisor sees the others' prior answers and rebuts or
-refines, ending each reply with a `CHANGED: yes/no` line and a `VERDICT:
-CONSENSUS/OPEN` line. Add **`until_settled`** to treat `rounds` as a *max* and stop
-early once **every active advisor reaches consensus**, or once **no advisor's
-position moves** in a round — the result is labelled *settled* / *stalemate* / *cap
-reached*. Convergence is the advisors' own self-report, not a string-compare, and it
-requires **full participation**: if an advisor errored or returned nothing that round,
-the council keeps deliberating (no false "all agreed" on a partial round) — the cap is
-the backstop (ADR 0010, quorum fix in ADR 0012).
+**Deliberation is host-mediated** (ADR 0016): `consult` runs **one round** and returns,
+telling you to form your own position and **call `consult` again** — with `my_take` set
+to your evolving position — to run the next round. The advisors keep their context
+(persistent sessions) and respond to *you*; you iterate until you judge agreement is
+reached, then act on it. So **you are a real participant**, not just the reader of an
+autonomous debate: cross-pollination flows through you (you integrate the voices and
+feed them back), round by round, for as long as it's worth it. There's no internal
+multi-round mode — the host drives the rounds.
+
+Pass **`members`** to choose who sits on the council for one call (default: every
+active advisor — the members other than you). Name a subset to convene just those (the
+host is never a member — it participates by driving the rounds, not by being spawned;
+ADR 0015).
 
 Pass **`fresh`** to run each advisor on a **throwaway session** — independent of any
 prior conversation and discarded when the consult ends — so the council's votes
@@ -178,8 +180,7 @@ instead of losing it. Pass a per-call `time` (seconds) to any tool to widen that
 idle window for a single big review/exploration. (The wait for a `permit`
 decision is **not** timed.) If your client caps tool calls more tightly, raise
 its timeout too — for Claude Code, `MCP_TOOL_TIMEOUT` (e.g. `600000`); `consult`
-runs every advisor concurrently within a round (and several rounds when
-deliberating), so it benefits most from a generous cap.
+runs every advisor concurrently in one round, so it benefits from a generous cap.
 The tool result stays focused on the member's answer plus a one-line footer
 (latency, tokens — Grok reports latency only); the full play-by-play goes to the
 debug log.
@@ -323,7 +324,7 @@ in [`src/permissions.ts`](src/permissions.ts).
 ```
 src/config.ts       env → Config + 3 per-member MemberSpecs + host-exclude override
 src/permissions.ts  guardianDecision — the pure permission policy
-src/council.ts      pure deliberation logic: parse verdicts + decide settlement
+src/council.ts      pure council-selection logic (selectCouncil)
 src/prompts.ts      host-parameterized prompts per tool (Codex/Grok/Claude, magi, generate)
 src/session.ts      AcpSession — ACP client: spawn a member, persistent session, streaming ask()
 src/reset.ts        per-workspace reset-nonce path (shared by server + hook)
@@ -346,4 +347,4 @@ bun run typecheck
 real ACP *agent* subprocess scripted by `--scenario` — through the genuine
 spawn → prompt → permission → cancel path, covering suspend/resume, reset, idle
 timeout, external cancel, crash-fails-fast, gate serialization, and nonce reset.
-`test/council.test.ts` unit-tests the pure convergence logic in `src/council.ts`.
+`test/council.test.ts` unit-tests the pure council-selection logic in `src/council.ts`.

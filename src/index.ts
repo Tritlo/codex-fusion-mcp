@@ -5,7 +5,7 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { loadConfig, MEMBER_IDS, type MemberId, type MemberSpec } from "./config.ts";
-import { councilSettlement } from "./council.ts";
+import { selectCouncil } from "./council.ts";
 import {
   AcpSession,
   NoPendingPermission,
@@ -22,7 +22,6 @@ import {
   explorePrompt,
   grokGeneratePrompt,
   magiAdvisorPrompt,
-  magiDeliberatePrompt,
   replyPrompt,
   reviewDiffPrompt,
   reviewPlanPrompt,
@@ -512,34 +511,27 @@ server.registerTool(
   "consult",
   {
     description:
-      "Consult the Magi council — every active advisor (the council members other than you) gives an independent view, and you synthesize. With `rounds` > 1 the advisors deliberate: round 1 is independent, then each sees the others' answers and rebuts/refines (each ends with a CONSENSUS/OPEN verdict). With `until_settled`, `rounds` is the max and it stops early once all advisors reach consensus or the debate stalls. For one specific advisor use `ask_codex`/`ask_grok`/`ask_claude`; for a structured single-advisor pass use `review_plan`/`review_diff`/`brainstorm`/`explore` (those take `member: \"council\"` to fan out one round to all).",
+      "Consult the Magi council — every active advisor (the council members other than you) gives an independent view in one round, and you synthesize. Deliberation is host-mediated: it returns after one round; to make the council deliberate, weigh in and **call `consult` again** with `my_take` set to your evolving position (the advisors keep their context and respond to you), iterating until you judge agreement is reached. For one specific advisor use `ask_codex`/`ask_grok`/`ask_claude`; for a structured single-advisor pass use `review_plan`/`review_diff`/`brainstorm`/`explore` (those take `member: \"council\"` to fan out to all).",
     inputSchema: {
       question: z.string().describe("The question or decision to put to the council."),
       context: z.string().optional().describe("Optional background or constraints."),
       my_take: z
         .string()
         .optional()
-        .describe("Your own current position, put before the council so the advisors can engage it directly."),
-      rounds: z
-        .number()
-        .int()
-        .min(1)
-        .max(8)
-        .optional()
         .describe(
-          "Number of deliberation rounds (default 1 = independent panel, no cross-talk). 2+ makes the advisors hear and respond to each other. With `until_settled`, this is the max.",
-        ),
-      until_settled: z
-        .boolean()
-        .optional()
-        .describe(
-          "Treat `rounds` as a cap and stop early once all advisors reach CONSENSUS, or no advisor's position moves in a round. Default false.",
+          "Your own current position, put before the council so the advisors engage it directly. Update this and call again to run the next round of the deliberation.",
         ),
       fresh: z
         .boolean()
         .optional()
         .describe(
-          "Run each advisor on a throwaway session — independent of any prior conversation and discarded afterward — so the council's votes don't carry or leave cross-call context. Slower (each advisor spawns fresh). Default false (reuse the persistent collaborator sessions).",
+          "Run each advisor on a throwaway session — independent of any prior conversation and discarded afterward — so the council's votes don't carry or leave cross-call context. Slower (each advisor spawns fresh). Default false (reuse the persistent collaborator sessions). Note: `fresh` makes each call independent, so it doesn't accumulate the host-mediated deliberation across calls.",
+        ),
+      members: z
+        .array(z.enum(["claude", "codex", "grok"]))
+        .optional()
+        .describe(
+          "Which members sit on the council for this call. Omit for the default — every active advisor (the members other than you). Name a subset to convene just those. (The host is never a member; it participates by driving the rounds.)",
         ),
       ...timeField,
     },
@@ -551,9 +543,8 @@ interface MagiArgs {
   question: string;
   context?: string;
   my_take?: string;
-  rounds?: number;
-  until_settled?: boolean;
   fresh?: boolean;
+  members?: MemberId[];
   time?: number;
 }
 
@@ -632,6 +623,8 @@ async function councilFanOut(
   extra: Extra,
   timeoutMs: number | undefined,
   getSession: SessionFor = persistentSession,
+  ids: MemberId[] = activeIds(),
+  synth?: string,
 ): Promise<ToolResult> {
   const host = hostName();
   const sections: string[] = [];
@@ -640,117 +633,66 @@ async function councilFanOut(
 
   const notify = progressNotifier(extra); // one shared channel for all concurrent advisors
   const voices = await Promise.all(
-    activeIds().map((id) =>
+    ids.map((id) =>
       councilTurn(id, buildPrompt(id), label, `${specs[id].name} `, extra, notify, timeoutMs, getSession),
     ),
   );
   sections.push(...voices.map((v) => v.markup));
 
-  const synth = `_You (${host}) are the lead — weigh these voices and decide. Follow up with the active members' reply tools (\`codex_reply\` / \`grok_reply\` / \`claude_reply\`), or ask one directly (\`ask_codex\` / \`ask_grok\` / \`ask_claude\`)._`;
-  return { content: [{ type: "text", text: [...sections, synth].join("\n\n---\n\n") }] };
+  const footer =
+    synth ??
+    `_You (${host}) are the lead — weigh these voices and decide. Follow up with the active members' reply tools (\`codex_reply\` / \`grok_reply\` / \`claude_reply\`), or ask one directly (\`ask_codex\` / \`ask_grok\` / \`ask_claude\`)._`;
+  return { content: [{ type: "text", text: [...sections, footer].join("\n\n---\n\n") }] };
 }
 
 /**
- * Run the Magi council. `rounds` = 1 (default) is an independent panel (no
- * cross-talk). `rounds` > 1 deliberates: round 1 independent, then each advisor
- * sees the others' prior answers and responds with a CHANGED/VERDICT line. With
- * `until_settled`, `rounds` is the cap and the loop stops early once all advisors
- * reach consensus, or no advisor's position moves in a round (see
- * {@link councilSettlement}). With `fresh`, each advisor runs on a throwaway
- * session — independent of any prior conversation and discarded after — so the
- * council's votes don't carry or leave cross-call context.
+ * Run one round of the Magi council: every selected advisor answers the question
+ * independently (concurrently), and the result tells the host to weigh in and call
+ * again to deliberate. The host *is* the deliberation loop — there is no autonomous
+ * multi-round mode; the host drives the rounds by re-calling with an updated
+ * `my_take`. With `fresh`, each advisor runs on a throwaway session (so a call
+ * doesn't carry or leave cross-call context — and so doesn't accumulate the loop).
  */
 async function runMagi(args: MagiArgs, extra: Extra): Promise<ToolResult> {
   const { question, context, my_take, time } = args;
-  const maxRounds = Math.max(1, Math.min(args.rounds ?? 1, 8));
-  const untilSettled = args.until_settled ?? false;
   const fresh = args.fresh ?? false;
   const timeoutMs = time !== undefined ? time * 1000 : undefined;
   const host = hostName();
-  const active = activeIds();
 
-  // For `fresh`, give each advisor a one-shot session, reused across this
-  // consult's rounds and disposed when it ends — never the persistent one.
+  // Who's on the council this call: the default active advisors, or an explicit
+  // subset of them. The host is never a member — it participates by *driving* the
+  // rounds (see the closing instruction), not by being spawned.
+  const active = selectCouncil(args.members, activeIds());
+  if (active.length === 0) {
+    return { content: [{ type: "text", text: "No active council members in your selection." }] };
+  }
+
+  // For `fresh`, give each advisor a one-shot session, disposed when this call
+  // ends — never the persistent one.
   const ephemeral: Partial<Record<MemberId, AcpSession>> = {};
   const getSession: SessionFor = fresh
     ? (id) => (ephemeral[id] ??= new AcpSession(config, specs[id]))
     : persistentSession;
 
   try {
-    // Single-round panel — the common case.
-    if (maxRounds === 1) {
-      return await councilFanOut(
-        "consult",
-        (id) =>
-          magiAdvisorPrompt({
-            advisor: specs[id].promptName,
-            host,
-            question,
-            context,
-            hostTake: my_take,
-            fellowAdvisors: active.filter((x) => x !== id).map((x) => specs[x].name),
-            grokStrengths: id === "grok",
-          }),
-        extra,
-        timeoutMs,
-        getSession,
-      );
-    }
-
-    const blocks: string[] = [];
-    const warning = unknownHostWarning();
-    if (warning) blocks.push(warning);
-
-    const notify = progressNotifier(extra); // one shared channel across all rounds + advisors
-    let prev: Array<{ name: string; text: string }> = [];
-    let outcome = "";
-
-    for (let round = 1; round <= maxRounds; round++) {
-      const buildPrompt = (id: MemberId): string =>
-        round === 1
-          ? magiAdvisorPrompt({
-              advisor: specs[id].promptName,
-              host,
-              question,
-              context,
-              hostTake: my_take,
-              fellowAdvisors: active.filter((x) => x !== id).map((x) => specs[x].name),
-              grokStrengths: id === "grok",
-            })
-          : magiDeliberatePrompt({
-              advisor: specs[id].promptName,
-              host,
-              question,
-              context,
-              hostTake: my_take,
-              priorPositions: prev,
-              round,
-              maxRounds,
-              grokStrengths: id === "grok",
-            });
-
-      const voices = await Promise.all(
-        active.map((id) => councilTurn(id, buildPrompt(id), "consult", `${specs[id].name} R${round} `, extra, notify, timeoutMs, getSession)),
-      );
-      blocks.push(
-        `## Round ${round}${round === 1 ? " — independent openings" : ""}\n\n${voices.map((v) => v.markup).join("\n\n---\n\n")}`,
-      );
-      prev = voices.map((v) => ({ name: v.name, text: v.text }));
-
-      if (untilSettled && round >= 2) {
-        const settlement = councilSettlement(round, prev);
-        if (settlement.done) {
-          outcome = settlement.message;
-          break;
-        }
-      }
-      if (round === maxRounds) {
-        outcome = untilSettled ? `⏹️ Reached the ${maxRounds}-round cap without consensus.` : `Completed ${maxRounds} rounds.`;
-      }
-    }
-
-    const synth = `${outcome ? `${outcome}\n\n` : ""}_You (${host}) are the lead — weigh the debate and decide. Continue with the reply tools or another \`consult\`._`;
-    return { content: [{ type: "text", text: [...blocks, synth].join("\n\n---\n\n") }] };
+    return await councilFanOut(
+      "consult",
+      (id) =>
+        magiAdvisorPrompt({
+          advisor: specs[id].promptName,
+          host,
+          question,
+          context,
+          hostTake: my_take,
+          fellowAdvisors: active.filter((x) => x !== id).map((x) => specs[x].name),
+          grokStrengths: id === "grok",
+        }),
+      extra,
+      timeoutMs,
+      getSession,
+      active,
+      `_You (${host}) are the lead **and a participant** in this deliberation. Read these views and form your own position. **Unless you and the council have reached agreement, call \`consult\` again** with \`my_take\` set to your current position (and any new framing in \`context\`) to run the next round — the advisors keep their context and will respond to you. Iterate until you judge agreement is reached, then act on it. (Or ask one directly with \`ask_codex\`/\`ask_grok\`/\`ask_claude\`.)_`,
+    );
   } finally {
     for (const s of Object.values(ephemeral)) s?.dispose();
   }

@@ -219,44 +219,6 @@ export function magiAdvisorPrompt(opts: {
 }
 
 /**
- * A later deliberation round: the advisor sees every advisor's previous-round
- * position and responds — engaging the others, updating where warranted, and
- * ending with a `CHANGED:` line (did its position move?) and a CONSENSUS/OPEN
- * verdict. The council loop reads both to detect when the debate has settled (all
- * CONSENSUS) or stalled (no one moved).
- */
-export function magiDeliberatePrompt(opts: {
-  advisor: string;
-  host: string;
-  question: string;
-  context?: string;
-  hostTake?: string;
-  priorPositions: Array<{ name: string; text: string }>;
-  round: number;
-  maxRounds: number;
-  grokStrengths?: boolean;
-}): string {
-  const positions = opts.priorPositions
-    .map((p) => `### ${p.name}\n${p.text.trim() || "(no usable answer)"}`)
-    .join("\n\n");
-  const fellows = opts.priorPositions.map((p) => p.name).filter((n) => n !== opts.advisor);
-  return assemble(
-    opts.advisor,
-    opts.host,
-    magiFrame(opts.host, fellows),
-    `<deliberation_round>\nThis is round ${opts.round} of up to ${opts.maxRounds}. Below are every advisor's positions from the previous round (including your own). Engage the others directly: say where you agree, where you disagree and why, and update your own view if they've changed your mind. Converge if you honestly can; hold your ground with reasons if you can't.\n</deliberation_round>`,
-    `<question>\n${opts.question.trim()}\n</question>`,
-    withContext(opts.context),
-    opts.hostTake && opts.hostTake.trim().length > 0 ? `<host_position>\n${opts.hostTake.trim()}\n</host_position>` : "",
-    `<previous_round>\n${positions}\n</previous_round>`,
-    opts.grokStrengths ? GROK_STRENGTHS_COUNCIL : "",
-    DELIBERATION_ONLY,
-    `<output_contract>\nRespond in ≤4 sentences, then up to ~4 bullets engaging the other advisors. Then end with EXACTLY these two final lines:\nCHANGED: <YES if your position moved from your previous-round answer, otherwise NO>\nVERDICT: CONSENSUS — <the one-sentence conclusion you now share with the council>  (or)  VERDICT: OPEN — <the single most important point still unresolved>\n</output_contract>`,
-    GROUNDING,
-  );
-}
-
-/**
  * Ask Grok to generate an image or short video and save it into the workspace
  * (the `grok_generate` tool). Not a reviewer turn — it produces media, then
  * reports the path(s) so the host can surface the file.
