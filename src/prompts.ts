@@ -220,8 +220,9 @@ export function magiAdvisorPrompt(opts: {
 /**
  * A later deliberation round: the advisor sees every advisor's previous-round
  * position and responds — engaging the others, updating where warranted, and
- * ending with a CONSENSUS/OPEN verdict the council loop uses to detect when the
- * debate has settled or stalled.
+ * ending with a `CHANGED:` line (did its position move?) and a CONSENSUS/OPEN
+ * verdict. The council loop reads both to detect when the debate has settled (all
+ * CONSENSUS) or stalled (no one moved).
  */
 export function magiDeliberatePrompt(opts: {
   advisor: string;
@@ -249,7 +250,7 @@ export function magiDeliberatePrompt(opts: {
     `<previous_round>\n${positions}\n</previous_round>`,
     opts.grokStrengths ? GROK_STRENGTHS_COUNCIL : "",
     DELIBERATION_ONLY,
-    `<output_contract>\nRespond in ≤4 sentences, then up to ~4 bullets engaging the other advisors. Then end with EXACTLY one final line, one of:\nVERDICT: CONSENSUS — <the one-sentence conclusion you now share with the council>\nVERDICT: OPEN — <the single most important point still unresolved>\n</output_contract>`,
+    `<output_contract>\nRespond in ≤4 sentences, then up to ~4 bullets engaging the other advisors. Then end with EXACTLY these two final lines:\nCHANGED: <YES if your position moved from your previous-round answer, otherwise NO>\nVERDICT: CONSENSUS — <the one-sentence conclusion you now share with the council>  (or)  VERDICT: OPEN — <the single most important point still unresolved>\n</output_contract>`,
     GROUNDING,
   );
 }

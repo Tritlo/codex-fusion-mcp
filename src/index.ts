@@ -5,6 +5,7 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { loadConfig, MEMBER_IDS, type MemberId, type MemberSpec } from "./config.ts";
+import { councilSettlement } from "./council.ts";
 import {
   AcpSession,
   NoPendingPermission,
@@ -508,7 +509,13 @@ server.registerTool(
         .boolean()
         .optional()
         .describe(
-          "Treat `rounds` as a cap and stop early once all advisors reach CONSENSUS, or the debate stalls (verdicts stop changing). Default false.",
+          "Treat `rounds` as a cap and stop early once all advisors reach CONSENSUS, or no advisor's position moves in a round. Default false.",
+        ),
+      fresh: z
+        .boolean()
+        .optional()
+        .describe(
+          "Run each advisor on a throwaway session — independent of any prior conversation and discarded afterward — so the council's votes don't carry or leave cross-call context. Slower (each advisor spawns fresh). Default false (reuse the persistent collaborator sessions).",
         ),
       ...timeField,
     },
@@ -522,6 +529,7 @@ interface MagiArgs {
   my_take?: string;
   rounds?: number;
   until_settled?: boolean;
+  fresh?: boolean;
   time?: number;
 }
 
@@ -537,120 +545,141 @@ function renderVoice(name: string, result: AskResult | null): string {
   return lines.join("\n");
 }
 
+/** Resolves the session a council turn runs on — the persistent one, or an
+ * ephemeral one for a `fresh` consult. */
+type SessionFor = (id: MemberId) => AcpSession;
+const persistentSession: SessionFor = (id) => sessions[id];
+
 /**
- * Fan a task out to every active advisor, in member order, and render their
- * voices for the host to synthesize. `buildPrompt(id)` produces each advisor's
- * prompt. Sequential and atomic — each turn auto-denies guardian "ask" so the
- * whole council is one tool call. Each member is caught independently so one
- * failure still returns the others. (Advisors answer independently; they do not
- * see each other's replies.)
+ * Run one advisor's council turn (read-only, atomic — guardian "ask" auto-denies,
+ * so it never suspends), returning both its rendered voice and its raw answer text
+ * (for the settlement check). Member errors are caught and rendered, so one failing
+ * advisor never sinks the others.
+ */
+async function councilTurn(
+  id: MemberId,
+  prompt: string,
+  label: string,
+  prefix: string,
+  extra: Extra,
+  timeoutMs: number | undefined,
+  getSession: SessionFor,
+): Promise<{ name: string; markup: string; text: string }> {
+  const name = specs[id].name;
+  try {
+    const outcome = await getSession(id).ask(prompt, {
+      label,
+      signal: extra.signal,
+      timeoutMs,
+      onAskPermission: "read-only",
+      ...streamHooks(extra, prefix),
+    });
+    const result = outcome.type === "answer" ? outcome.result : null;
+    return { name, markup: renderVoice(name, result), text: result?.text ?? "" };
+  } catch (err) {
+    return {
+      name,
+      markup: `### ${name}\n\n${renderMemberError(name, err, specs[id].loginHint).content[0]!.text}`,
+      text: "",
+    };
+  }
+}
+
+/** Prepended when the host is unrecognized (one voice may be the host itself). */
+function unknownHostWarning(): string | undefined {
+  const r = resolveHost();
+  return r.source === "unknown"
+    ? `⚠️ Host not recognized (clientInfo: ${r.rawClient ?? "none"}); all three members are participating, so one of these voices may be you. Set \`MAGI_COUNCIL_EXCLUDE=claude|codex|grok\` to exclude yourself.`
+    : undefined;
+}
+
+/**
+ * Fan a task out to every active advisor and render their voices for the host to
+ * synthesize. `buildPrompt(id)` produces each advisor's prompt. Advisors run
+ * **concurrently** (each on its own session/gate) and are rendered in member
+ * order; the whole council is still one atomic tool call. Each member is caught
+ * independently so one failure still returns the others. (Advisors answer
+ * independently; they do not see each other's replies.)
  */
 async function councilFanOut(
   label: string,
   buildPrompt: (id: MemberId) => string,
   extra: Extra,
   timeoutMs: number | undefined,
+  getSession: SessionFor = persistentSession,
 ): Promise<ToolResult> {
   const host = hostName();
-  const r = resolveHost();
   const sections: string[] = [];
+  const warning = unknownHostWarning();
+  if (warning) sections.push(warning);
 
-  if (r.source === "unknown") {
-    sections.push(
-      `⚠️ Host not recognized (clientInfo: ${r.rawClient ?? "none"}); all three members are participating, so one of these voices may be you. Set \`MAGI_COUNCIL_EXCLUDE=claude|codex|grok\` to exclude yourself.`,
-    );
-  }
-
-  for (const id of activeIds()) {
-    try {
-      const outcome = await sessions[id].ask(buildPrompt(id), {
-        label,
-        signal: extra.signal,
-        timeoutMs,
-        onAskPermission: "read-only",
-        ...streamHooks(extra, `${specs[id].name} `),
-      });
-      const result = outcome.type === "answer" ? outcome.result : null;
-      sections.push(renderVoice(specs[id].name, result));
-    } catch (err) {
-      sections.push(`### ${specs[id].name}\n\n${renderMemberError(specs[id].name, err, specs[id].loginHint).content[0]!.text}`);
-    }
-  }
+  const voices = await Promise.all(
+    activeIds().map((id) =>
+      councilTurn(id, buildPrompt(id), label, `${specs[id].name} `, extra, timeoutMs, getSession),
+    ),
+  );
+  sections.push(...voices.map((v) => v.markup));
 
   const synth = `_You (${host}) are the lead — weigh these voices and decide. Follow up with the active members' reply tools (\`codex_reply\` / \`grok_reply\` / \`claude_reply\`), or ask one directly (\`ask_codex\` / \`ask_grok\` / \`ask_claude\`)._`;
   return { content: [{ type: "text", text: [...sections, synth].join("\n\n---\n\n") }] };
 }
 
-/** Classify an advisor's VERDICT line, if present. */
-function verdictKind(text: string): "consensus" | "open" | null {
-  const m = text.match(/^[\s>*_-]*\**\s*VERDICT:\s*\**\s*(CONSENSUS|OPEN)\b/im);
-  return m ? (m[1]!.toUpperCase() === "CONSENSUS" ? "consensus" : "open") : null;
-}
-
-/** Normalized VERDICT line, for detecting a debate whose positions stopped moving. */
-function verdictSignature(text: string): string {
-  const m = text.match(/^.*VERDICT:.*$/im);
-  return (m ? m[0] : text.slice(-120)).replace(/[\s*_>-]+/g, " ").trim().toLowerCase();
-}
-
-/** True if two non-empty signature lists are the same multiset. */
-function sameMultiset(a: string[], b: string[]): boolean {
-  if (a.length === 0 || a.length !== b.length) return false;
-  const sa = [...a].sort();
-  const sb = [...b].sort();
-  return sa.every((v, i) => v === sb[i]);
-}
-
 /**
  * Run the Magi council. `rounds` = 1 (default) is an independent panel (no
  * cross-talk). `rounds` > 1 deliberates: round 1 independent, then each advisor
- * sees the others' prior answers and responds with a CONSENSUS/OPEN verdict. With
+ * sees the others' prior answers and responds with a CHANGED/VERDICT line. With
  * `until_settled`, `rounds` is the cap and the loop stops early once all advisors
- * reach consensus or the debate stalls (verdicts stop changing).
+ * reach consensus, or no advisor's position moves in a round (see
+ * {@link councilSettlement}). With `fresh`, each advisor runs on a throwaway
+ * session — independent of any prior conversation and discarded after — so the
+ * council's votes don't carry or leave cross-call context.
  */
 async function runMagi(args: MagiArgs, extra: Extra): Promise<ToolResult> {
   const { question, context, my_take, time } = args;
   const maxRounds = Math.max(1, Math.min(args.rounds ?? 1, 8));
   const untilSettled = args.until_settled ?? false;
+  const fresh = args.fresh ?? false;
   const timeoutMs = time !== undefined ? time * 1000 : undefined;
   const host = hostName();
-
-  // Single-round panel — the common case, today's behavior.
-  if (maxRounds === 1) {
-    return councilFanOut(
-      "consult",
-      (id) =>
-        magiAdvisorPrompt({
-          advisor: specs[id].promptName,
-          host,
-          question,
-          context,
-          hostTake: my_take,
-          fellowAdvisors: activeIds().filter((x) => x !== id).map((x) => specs[x].name),
-          grokStrengths: id === "grok",
-        }),
-      extra,
-      timeoutMs,
-    );
-  }
-
   const active = activeIds();
-  const blocks: string[] = [];
-  if (resolveHost().source === "unknown") {
-    blocks.push(
-      `⚠️ Host not recognized; all three members are participating, so one voice may be you. Set \`MAGI_COUNCIL_EXCLUDE=claude|codex|grok\` to exclude yourself.`,
-    );
-  }
 
-  let prev: Array<{ name: string; text: string }> = [];
-  let prevSig: string[] = [];
-  let outcome = "";
+  // For `fresh`, give each advisor a one-shot session, reused across this
+  // consult's rounds and disposed when it ends — never the persistent one.
+  const ephemeral: Partial<Record<MemberId, AcpSession>> = {};
+  const getSession: SessionFor = fresh
+    ? (id) => (ephemeral[id] ??= new AcpSession(config, specs[id]))
+    : persistentSession;
 
-  for (let round = 1; round <= maxRounds; round++) {
-    const cur: Array<{ name: string; text: string }> = [];
-    const voices: string[] = [];
-    for (const id of active) {
-      const prompt =
+  try {
+    // Single-round panel — the common case.
+    if (maxRounds === 1) {
+      return await councilFanOut(
+        "consult",
+        (id) =>
+          magiAdvisorPrompt({
+            advisor: specs[id].promptName,
+            host,
+            question,
+            context,
+            hostTake: my_take,
+            fellowAdvisors: active.filter((x) => x !== id).map((x) => specs[x].name),
+            grokStrengths: id === "grok",
+          }),
+        extra,
+        timeoutMs,
+        getSession,
+      );
+    }
+
+    const blocks: string[] = [];
+    const warning = unknownHostWarning();
+    if (warning) blocks.push(warning);
+
+    let prev: Array<{ name: string; text: string }> = [];
+    let outcome = "";
+
+    for (let round = 1; round <= maxRounds; round++) {
+      const buildPrompt = (id: MemberId): string =>
         round === 1
           ? magiAdvisorPrompt({
               advisor: specs[id].promptName,
@@ -672,44 +701,32 @@ async function runMagi(args: MagiArgs, extra: Extra): Promise<ToolResult> {
               maxRounds,
               grokStrengths: id === "grok",
             });
-      try {
-        const o = await sessions[id].ask(prompt, {
-          label: "consult",
-          signal: extra.signal,
-          timeoutMs,
-          onAskPermission: "read-only",
-          ...streamHooks(extra, `${specs[id].name} R${round} `),
-        });
-        const result = o.type === "answer" ? o.result : null;
-        cur.push({ name: specs[id].name, text: result?.text ?? "" });
-        voices.push(renderVoice(specs[id].name, result));
-      } catch (err) {
-        cur.push({ name: specs[id].name, text: "" });
-        voices.push(`### ${specs[id].name}\n\n${renderMemberError(specs[id].name, err, specs[id].loginHint).content[0]!.text}`);
-      }
-    }
-    blocks.push(`## Round ${round}${round === 1 ? " — independent openings" : ""}\n\n${voices.join("\n\n---\n\n")}`);
 
-    const sig = cur.map((c) => verdictSignature(c.text));
-    if (untilSettled && round >= 2) {
-      if (cur.every((c) => verdictKind(c.text) === "consensus")) {
-        outcome = `✅ **Settled** — all advisors reached consensus after ${round} rounds.`;
-        break;
+      const voices = await Promise.all(
+        active.map((id) => councilTurn(id, buildPrompt(id), "consult", `${specs[id].name} R${round} `, extra, timeoutMs, getSession)),
+      );
+      blocks.push(
+        `## Round ${round}${round === 1 ? " — independent openings" : ""}\n\n${voices.map((v) => v.markup).join("\n\n---\n\n")}`,
+      );
+      prev = voices.map((v) => ({ name: v.name, text: v.text }));
+
+      if (untilSettled && round >= 2) {
+        const settlement = councilSettlement(round, prev);
+        if (settlement.done) {
+          outcome = settlement.message;
+          break;
+        }
       }
-      if (sameMultiset(sig, prevSig)) {
-        outcome = `⚖️ **Stalemate** — positions stopped changing after ${round} rounds.`;
-        break;
+      if (round === maxRounds) {
+        outcome = untilSettled ? `⏹️ Reached the ${maxRounds}-round cap without consensus.` : `Completed ${maxRounds} rounds.`;
       }
     }
-    prevSig = sig;
-    prev = cur;
-    if (round === maxRounds) {
-      outcome = untilSettled ? `⏹️ Reached the ${maxRounds}-round cap without consensus.` : `Completed ${maxRounds} rounds.`;
-    }
+
+    const synth = `${outcome ? `${outcome}\n\n` : ""}_You (${host}) are the lead — weigh the debate and decide. Continue with the reply tools or another \`consult\`._`;
+    return { content: [{ type: "text", text: [...blocks, synth].join("\n\n---\n\n") }] };
+  } finally {
+    for (const s of Object.values(ephemeral)) s?.dispose();
   }
-
-  const synth = `${outcome ? `${outcome}\n\n` : ""}_You (${host}) are the lead — weigh the debate and decide. Continue with the reply tools or another \`consult\`._`;
-  return { content: [{ type: "text", text: [...blocks, synth].join("\n\n---\n\n") }] };
 }
 
 // --- Shared session controls ----------------------------------------------
