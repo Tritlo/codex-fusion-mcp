@@ -210,6 +210,10 @@ export class AcpSession {
   // Serializes turns; the holder releases it when the turn fully ends.
   private turnGate: Promise<void> = Promise.resolve();
   private releaseGate?: () => void;
+  // How many ask() calls are queued waiting for the gate. A turn that would
+  // suspend on a permission while someone is waiting abandons instead of parking,
+  // so the queued ask can't wedge behind a turn that may never be permitted.
+  private gateWaiters = 0;
   // Generation token: bumped per turn so stale async work (a force-reset turn's
   // background prompt, or a superseded segment) can't mutate a newer turn.
   private turnId = 0;
@@ -602,7 +606,12 @@ export class AcpSession {
     // Key on awaitingDecision (the suspended marker), not releaseGate, which is
     // set for every in-flight turn and would wrongly abandon a running one.
     if (this.awaitingDecision) this.reset();
-    await this.acquireGate();
+    this.gateWaiters++;
+    try {
+      await this.acquireGate();
+    } finally {
+      this.gateWaiters--;
+    }
     const id = ++this.turnId;
     this.turnLabel = opts.label ?? "turn";
     this.turnReadOnly = opts.onAskPermission === "read-only";
@@ -723,6 +732,18 @@ export class AcpSession {
         return { type: "answer", result: { text: "", stopReason: "cancelled", log: [], ms: 0 } };
       }
       if (event.kind === "permission") {
+        // If another ask is already queued behind the gate, parking here (the
+        // suspended turn holds the gate) would wedge it until this turn is
+        // permitted — which may never happen. Abandon instead: cancel the request
+        // and finish, releasing the gate so the queued ask takes over. This
+        // extends "a new ask abandons a suspended turn" to the concurrent case.
+        if (this.gateWaiters > 0) {
+          event.permission.cancel();
+          clearSegment();
+          const result = this.snapshot("cancelled");
+          this.finish(id);
+          return { type: "answer", result };
+        }
         // Suspend: keep the turn open; the wait for Claude's decision isn't timed.
         this.awaitingDecision = event.permission;
         clearSegment();

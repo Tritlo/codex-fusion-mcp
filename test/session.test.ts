@@ -107,6 +107,20 @@ test("a new ask abandons a suspended turn cleanly (settles the held permission)"
   expect(s.isAwaitingPermission()).toBe(true);
 }, 25_000); // two cold subprocess spawns (suspend, then reset+respawn) — generous under load
 
+test("a concurrent ask doesn't wedge behind a turn that suspends after it queued", async () => {
+  // Fire two asks before the first suspends. The first would park on a permission
+  // (holding the gate); since the second is already queued, the first must abandon
+  // so the second can run — otherwise the second wedges until a permit that may
+  // never come.
+  const s = makeSession("permission");
+  const [first, second] = await Promise.all([s.ask("write FOO"), s.ask("write BAR")]);
+  // One of them ends up the live suspended turn; the other was abandoned/cancelled.
+  // Neither hangs, and exactly one holds the pending permission.
+  const kinds = [first.type, second.type].sort();
+  expect(kinds).toEqual(["answer", "permission"]);
+  expect(s.isAwaitingPermission()).toBe(true);
+}, 25_000);
+
 test("explicit reset() clears a suspended turn", async () => {
   const s = makeSession("permission");
   const o1 = await s.ask("write FOO");
