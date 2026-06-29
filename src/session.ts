@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
@@ -90,6 +90,9 @@ interface PendingPermission {
   description: string;
   /** Resolve the held-open ACP request with Claude's decision. */
   decide: (allow: boolean) => void;
+  /** Settle the held-open ACP request as `cancelled` (e.g. the turn is reset
+   * before the host decides) so it isn't left dangling. */
+  cancel: () => void;
 }
 
 /**
@@ -196,13 +199,31 @@ export class AcpSession {
     const wanted: Array<PermissionOption["kind"]> = allow
       ? ["allow_once", "allow_always"]
       : ["reject_once", "reject_always"];
-    return wanted.map((kind) => options.find((o) => o.kind === kind)).find((o) => o !== undefined);
+    const chosen = wanted.map((kind) => options.find((o) => o.kind === kind)).find((o) => o !== undefined);
+    // A one-shot allow that the agent only offers as `allow_always` would silently
+    // become a standing grant for this session. Honor it (denying would block a
+    // host "allow" entirely), but surface it so the host isn't surprised.
+    if (chosen && allow && chosen.kind === "allow_always") {
+      const note = "note: agent offered no one-shot allow; granted as allow_always (persists this session)";
+      this.turnLog.push(note);
+      this.turnOnActivity?.(note);
+    }
+    return chosen;
   }
 
-  /** True if reading `abs` is allowed: inside the workspace, or external reads enabled. */
+  /** True if reading `abs` is allowed: inside the workspace, or external reads enabled.
+   * Compares *real* (symlink-resolved) paths so an in-workspace symlink can't point
+   * outside the sandbox and escape the read scope. */
   private isReadable(abs: string): boolean {
     if (this.config.allowExternalReads) return true;
-    const rel = relative(this.config.workspaceRoot, abs);
+    const real = (p: string): string => {
+      try {
+        return realpathSync(p);
+      } catch {
+        return resolve(p); // path (or a parent) doesn't exist yet — fall back to lexical
+      }
+    };
+    const rel = relative(real(this.config.workspaceRoot), real(abs));
     return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
   }
 
@@ -255,6 +276,7 @@ export class AcpSession {
                   : { outcome: { outcome: "cancelled" } },
               );
             },
+            cancel: () => resolveAcp({ outcome: { outcome: "cancelled" } }),
           };
           this.pushEvent({ kind: "permission", permission });
         });
@@ -334,7 +356,12 @@ export class AcpSession {
       this.stderr.push(d.toString());
       if (this.stderr.length > 50) this.stderr.shift();
     });
-    // If the agent dies, drop the session so the next turn respawns it.
+    // If the agent dies, drop the session so the next turn respawns it. When
+    // `this.child === child` the death was *unexpected* (we null `this.child`
+    // before killing in forceReset/startup-cleanup, so those paths don't match);
+    // wake any waiting turn with a failure so it fails fast instead of sitting
+    // out the idle timeout. A stale event with no turn in flight is harmless —
+    // ask() clears the queue before launching.
     child.on("exit", (code, signal) => {
       this.stderr.push(`${this.member.name} exited (code=${code} signal=${signal})`);
       if (this.child === child) {
@@ -342,6 +369,10 @@ export class AcpSession {
         this.conn = undefined;
         this.sessionId = undefined;
         this.starting = undefined;
+        this.pushEvent({
+          kind: "failed",
+          error: new Error(`${this.member.name} exited unexpectedly (code=${code} signal=${signal})`),
+        });
       }
     });
     if (!child.stdin || !child.stdout) throw new Error(`${this.member.name}: no stdio pipes`);
@@ -699,6 +730,9 @@ export class AcpSession {
    */
   reset(): void {
     this.turnId++; // invalidate the old turn's in-flight async work
+    // Settle a held-open permission request (best effort, before we kill the
+    // child) so the suspended turn's ACP promise isn't left dangling.
+    this.awaitingDecision?.cancel();
     this.forceReset();
     this.awaitingDecision = undefined;
     const waiter = this.eventWaiter;
@@ -709,14 +743,28 @@ export class AcpSession {
     this.releaseGate = undefined;
   }
 
-  /** Kill the subprocess and drop the session so the next turn respawns cleanly. */
+  /** Kill the subprocess and drop the session so the next turn respawns cleanly.
+   * SIGTERM first, then SIGKILL after a grace if the child ignores it — the README
+   * promises a real hard stop, and a wedged agent must not survive as an orphan. */
   private forceReset(): void {
     const child = this.child;
     this.child = undefined;
     this.conn = undefined;
     this.sessionId = undefined;
     this.starting = undefined;
-    child?.kill();
+    if (!child) return;
+    child.kill(); // SIGTERM
+    const sigkill = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }
+    }, HARD_STOP_GRACE_MS);
+    if (typeof sigkill.unref === "function") sigkill.unref(); // don't keep the process alive
+    child.once("exit", () => clearTimeout(sigkill));
   }
 
   /** Current health, without starting a session. */
