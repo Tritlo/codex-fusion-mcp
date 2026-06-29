@@ -19,7 +19,6 @@ import {
   askCodexPrompt,
   askGrokPrompt,
   brainstormPrompt,
-  disagreementMatrixPrompt,
   explorePrompt,
   grokGeneratePrompt,
   magiAdvisorPrompt,
@@ -27,7 +26,6 @@ import {
   replyPrompt,
   reviewDiffPrompt,
   reviewPlanPrompt,
-  targetedDeliberatePrompt,
 } from "./prompts.ts";
 
 // The ACP agents (esp. Grok) emit `_x.ai/*` extension notifications and stray
@@ -543,12 +541,6 @@ server.registerTool(
         .describe(
           "Run each advisor on a throwaway session — independent of any prior conversation and discarded afterward — so the council's votes don't carry or leave cross-call context. Slower (each advisor spawns fresh). Default false (reuse the persistent collaborator sessions).",
         ),
-      matrix: z
-        .boolean()
-        .optional()
-        .describe(
-          "Experimental: after the independent openings, a scribe distils a structured disagreement matrix, then the advisors re-deliberate ONLY the contested claims (not the whole question). Focuses multi-round debate where it matters. Implies deliberation; `rounds` caps the targeted rounds. Default false.",
-        ),
       ...timeField,
     },
   },
@@ -562,7 +554,6 @@ interface MagiArgs {
   rounds?: number;
   until_settled?: boolean;
   fresh?: boolean;
-  matrix?: boolean;
   time?: number;
 }
 
@@ -686,23 +677,6 @@ async function runMagi(args: MagiArgs, extra: Extra): Promise<ToolResult> {
     : persistentSession;
 
   try {
-    // Disagreement-matrix mode (experimental): openings → scribe matrix → targeted
-    // rounds. Needs at least two advisors to have anything to contrast.
-    if (args.matrix && active.length >= 2) {
-      return await runMatrixConsult({
-        extra,
-        host,
-        active,
-        getSession,
-        question,
-        context,
-        myTake: my_take,
-        maxRounds,
-        untilSettled,
-        timeoutMs,
-      });
-    }
-
     // Single-round panel — the common case.
     if (maxRounds === 1) {
       return await councilFanOut(
@@ -780,127 +754,6 @@ async function runMagi(args: MagiArgs, extra: Extra): Promise<ToolResult> {
   } finally {
     for (const s of Object.values(ephemeral)) s?.dispose();
   }
-}
-
-/**
- * Disagreement-matrix consult (experimental): independent openings → a scribe
- * distils the points of disagreement → the advisors re-deliberate **only the
- * contested claims**, instead of re-arguing the whole question each round. The
- * matrix is surfaced for the host. Reuses {@link councilTurn}; ephemeral `fresh`
- * sessions (if any) are disposed by {@link runMagi}'s `finally`.
- */
-async function runMatrixConsult(p: {
-  extra: Extra;
-  host: string;
-  active: MemberId[];
-  getSession: SessionFor;
-  question: string;
-  context?: string;
-  myTake?: string;
-  maxRounds: number;
-  untilSettled: boolean;
-  timeoutMs: number | undefined;
-}): Promise<ToolResult> {
-  const { extra, host, active, getSession, question, context, myTake, maxRounds, untilSettled, timeoutMs } = p;
-  const notify = progressNotifier(extra); // one shared channel across the whole consult
-  const blocks: string[] = [];
-  const warning = unknownHostWarning();
-  if (warning) blocks.push(warning);
-
-  // Round 1 — independent openings.
-  const openings = await Promise.all(
-    active.map((id) =>
-      councilTurn(
-        id,
-        magiAdvisorPrompt({
-          advisor: specs[id].promptName,
-          host,
-          question,
-          context,
-          hostTake: myTake,
-          fellowAdvisors: active.filter((x) => x !== id).map((x) => specs[x].name),
-          grokStrengths: id === "grok",
-        }),
-        "consult",
-        `${specs[id].name} R1 `,
-        extra,
-        notify,
-        timeoutMs,
-        getSession,
-      ),
-    ),
-  );
-  blocks.push(`## Round 1 — independent openings\n\n${openings.map((v) => v.markup).join("\n\n---\n\n")}`);
-
-  // A scribe distils the disagreement matrix from the openings.
-  const scribe = active[0]!;
-  const scribeTurn = await councilTurn(
-    scribe,
-    disagreementMatrixPrompt({
-      scribe: specs[scribe].promptName,
-      host,
-      question,
-      openings: openings.map((v) => ({ name: v.name, text: v.text })),
-    }),
-    "consult",
-    `${specs[scribe].name} matrix `,
-    extra,
-    notify,
-    timeoutMs,
-    getSession,
-  );
-  const matrix = scribeTurn.text;
-  blocks.push(`## Disagreement matrix — distilled by ${specs[scribe].name}\n\n${matrix || "_(no matrix produced)_"}`);
-
-  // Targeted rounds — resolve only the contested claims. `rounds` caps these.
-  const targetedCap = Math.max(2, maxRounds);
-  let outcome = "";
-  for (let round = 2; round <= targetedCap; round++) {
-    const voices = await Promise.all(
-      active.map((id) =>
-        councilTurn(
-          id,
-          targetedDeliberatePrompt({
-            advisor: specs[id].promptName,
-            host,
-            question,
-            context,
-            hostTake: myTake,
-            matrix,
-            round,
-            maxRounds: targetedCap,
-            grokStrengths: id === "grok",
-          }),
-          "consult",
-          `${specs[id].name} R${round} `,
-          extra,
-          notify,
-          timeoutMs,
-          getSession,
-        ),
-      ),
-    );
-    blocks.push(`## Round ${round} — resolving contested claims\n\n${voices.map((v) => v.markup).join("\n\n---\n\n")}`);
-    if (untilSettled) {
-      const settlement = councilSettlement(
-        round,
-        voices.map((v) => ({ name: v.name, text: v.text })),
-      );
-      if (settlement.done) {
-        outcome = settlement.message;
-        break;
-      }
-    }
-    if (round === targetedCap) {
-      const n = targetedCap - 1;
-      outcome = untilSettled
-        ? `⏹️ Reached the ${targetedCap}-round cap without consensus.`
-        : `Completed targeted deliberation (${n} round${n === 1 ? "" : "s"}).`;
-    }
-  }
-
-  const synth = `${outcome ? `${outcome}\n\n` : ""}_You (${host}) are the lead — weigh the resolved matrix and decide. Continue with the reply tools or another \`consult\`._`;
-  return { content: [{ type: "text", text: [...blocks, synth].join("\n\n---\n\n") }] };
 }
 
 // --- Shared session controls ----------------------------------------------

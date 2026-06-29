@@ -1,6 +1,15 @@
-# 0013 — Targeted deliberation via a disagreement matrix (experimental)
+# 0013 — Targeted deliberation via a disagreement matrix (parked)
 
-**Status:** Experimental — opt-in via `consult { matrix: true }`.
+**Status:** Parked — prototyped, then **cut** in the simplification pass (ADR 0014).
+The implementation lives in git history (commit `9eba479`) if revived. Kept here as a
+record of the idea and why it didn't earn its place yet.
+
+**Update (cut).** A council quality-gate review unanimously flagged it as the top item
+to remove: it duplicated the `runMagi` round loop, added a 4th `consult` flag, shipped
+without tests, and the scribe (`active[0]`) was the same advisor that then deliberated —
+framing bias. The idea (focus re-deliberation on what's contested) is still appealing;
+revisit it as a *refinement of the core loop* (not a parallel path) with an isolated
+scribe and real tests, only if multi-round `consult` proves valuable enough to optimize.
 
 **Context.** Multi-round `consult` (ADR 0008/0010) re-argues the *whole* question every
 round: N advisors × R rounds of free-form rebuttal, most of it re-stating points already
