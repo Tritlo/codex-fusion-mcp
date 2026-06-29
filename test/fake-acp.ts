@@ -31,6 +31,7 @@ const stream = ndJsonStream(
 );
 
 let cancelled = false;
+let sessionCount = 0;
 
 new AgentSideConnection((conn): Agent => {
   return {
@@ -39,7 +40,10 @@ new AgentSideConnection((conn): Agent => {
     },
     async newSession() {
       if (sessionsFile) appendFileSync(sessionsFile, "x");
-      return { sessionId: "fake-session" };
+      // Unique per session, like real ACP agents — a respawn must not reuse an id
+      // (so a stale child's late messages are distinguishable from the new session).
+      sessionCount += 1;
+      return { sessionId: `fake-session-${process.pid}-${sessionCount}` };
     },
     async authenticate() {
       return {};

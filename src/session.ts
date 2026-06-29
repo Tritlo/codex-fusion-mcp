@@ -268,10 +268,17 @@ export class AcpSession {
   }
 
   private buildClient(): Client {
+    // Bind this client to the child it serves. After a reset/respawn the old child
+    // may briefly outlive its SIGTERM (until the SIGKILL grace) and emit late
+    // messages; reject them by *identity*, not just sessionId — an agent (or the
+    // test fake) could reuse a session id across sessions, and a stale chunk must
+    // never bleed into the new turn's state.
+    const owner = this.child;
+    const isStale = (sessionId: string): boolean => this.child !== owner || sessionId !== this.sessionId;
     return {
       requestPermission: async (params): Promise<RequestPermissionResponse> => {
-        // Ignore late requests from a superseded session (after a respawn).
-        if (params.sessionId !== this.sessionId) return { outcome: { outcome: "cancelled" } };
+        // Ignore late requests from a superseded session/child (after a respawn).
+        if (isStale(params.sessionId)) return { outcome: { outcome: "cancelled" } };
 
         // Resolve symlinks in the requested locations before the (pure) policy
         // sees them, so an in-workspace symlink to outside can't be auto-allowed
@@ -333,7 +340,7 @@ export class AcpSession {
         // Read-only client filesystem: serve reads scoped to the workspace (or
         // anywhere when external reads are enabled). Never writes. This gives the
         // member a non-shell read path that works even in read-only council mode.
-        if (params.sessionId !== this.sessionId) throw new Error("read for a superseded session");
+        if (isStale(params.sessionId)) throw new Error("read for a superseded session");
         const abs = resolve(params.path);
         if (!this.isReadable(abs)) {
           throw new Error(`read denied: ${params.path} is outside the workspace (set CODEX_FUSION_/MAGI_COUNCIL_ALLOW_EXTERNAL_READS to allow)`);
@@ -351,7 +358,7 @@ export class AcpSession {
         return { content };
       },
       sessionUpdate: async (params: SessionNotification): Promise<void> => {
-        if (params.sessionId !== this.sessionId) return; // drop stale-session updates
+        if (isStale(params.sessionId)) return; // drop updates from a stale session/child
         const u = params.update;
         // Real output (text, reasoning, tool progress, plan) resets the idle
         // timeout. Housekeeping updates (usage/mode/config/commands/session-info)
