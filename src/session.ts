@@ -823,9 +823,12 @@ export class AcpSession {
     };
   }
 
-  /** Terminate the member's ACP subprocess (hard-stop, so a SIGTERM-ignoring
-   * child — e.g. an ephemeral `fresh` member or one alive at shutdown — can't leak). */
+  /** Terminate the member's ACP subprocess immediately. Used for teardown —
+   * ephemeral `fresh` cleanup and process shutdown — where we want the child gone
+   * now, not gracefully: SIGKILL directly, since the deferred escalation in
+   * {@link hardKill} can't fire when the shutdown handler calls `process.exit`
+   * right after. (Mid-session cancels still use the graceful path via forceReset.) */
   dispose(): void {
-    if (this.child) hardKill(this.child);
+    this.child?.kill("SIGKILL");
   }
 }

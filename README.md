@@ -98,11 +98,12 @@ Pass **`rounds` > 1** to make them actually **deliberate**: round 1 is independe
 then in each later round every advisor sees the others' prior answers and rebuts or
 refines, ending each reply with a `CHANGED: yes/no` line and a `VERDICT:
 CONSENSUS/OPEN` line. Add **`until_settled`** to treat `rounds` as a *max* and stop
-early once **all (answering) advisors reach consensus**, or once **no advisor's
+early once **every active advisor reaches consensus**, or once **no advisor's
 position moves** in a round — the result is labelled *settled* / *stalemate* / *cap
-reached*. Convergence is the advisors' own self-report, not a string-compare, and an
-advisor that errored or returned nothing is excluded so it can't fake a stalemate
-(ADR 0010).
+reached*. Convergence is the advisors' own self-report, not a string-compare, and it
+requires **full participation**: if an advisor errored or returned nothing that round,
+the council keeps deliberating (no false "all agreed" on a partial round) — the cap is
+the backstop (ADR 0010, quorum fix in ADR 0012).
 
 Pass **`fresh`** to run each advisor on a **throwaway session** — independent of any
 prior conversation and discarded when the consult ends — so the council's votes
@@ -177,8 +178,8 @@ instead of losing it. Pass a per-call `time` (seconds) to any tool to widen that
 idle window for a single big review/exploration. (The wait for a `permit`
 decision is **not** timed.) If your client caps tool calls more tightly, raise
 its timeout too — for Claude Code, `MCP_TOOL_TIMEOUT` (e.g. `600000`); `consult`
-runs every advisor back-to-back (and several rounds when deliberating), so it
-benefits most from a generous cap.
+runs every advisor concurrently within a round (and several rounds when
+deliberating), so it benefits most from a generous cap.
 The tool result stays focused on the member's answer plus a one-line footer
 (latency, tokens — Grok reports latency only); the full play-by-play goes to the
 debug log.
@@ -337,7 +338,7 @@ docs/adr/000*.md    design decisions
 ## Tests
 
 ```bash
-bun test       # ~3s, deterministic, no network and no real model calls
+bun test       # deterministic, no network and no real model calls (a few seconds)
 bun run typecheck
 ```
 
