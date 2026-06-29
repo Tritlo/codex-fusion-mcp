@@ -734,14 +734,16 @@ export class AcpSession {
       if (event.kind === "permission") {
         // If another ask is already queued behind the gate, parking here (the
         // suspended turn holds the gate) would wedge it until this turn is
-        // permitted — which may never happen. Abandon instead: cancel the request
-        // and finish, releasing the gate so the queued ask takes over. This
-        // extends "a new ask abandons a suspended turn" to the concurrent case.
+        // permitted — which may never happen. Abandon instead, exactly like the
+        // sequential "new ask abandons a suspended turn" path: settle the request,
+        // snapshot, then reset() — which kills the child (so its late chunks can't
+        // bleed into the queued turn's output) and releases the gate so the queued
+        // ask takes over on a fresh session.
         if (this.gateWaiters > 0) {
           event.permission.cancel();
           clearSegment();
           const result = this.snapshot("cancelled");
-          this.finish(id);
+          this.reset();
           return { type: "answer", result };
         }
         // Suspend: keep the turn open; the wait for Claude's decision isn't timed.

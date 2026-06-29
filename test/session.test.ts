@@ -119,6 +119,11 @@ test("a concurrent ask doesn't wedge behind a turn that suspends after it queued
   const kinds = [first.type, second.type].sort();
   expect(kinds).toEqual(["answer", "permission"]);
   expect(s.isAwaitingPermission()).toBe(true);
+  // The surviving turn resumes with CLEAN output — the abandoned turn's child is
+  // killed, so its late chunks can't bleed in (would show as e.g. "BLOCKED-FOO").
+  const resumed = await s.permit(true);
+  expect(resumed.type).toBe("answer");
+  if (resumed.type === "answer") expect(resumed.result.text).toBe("WROTE-FOO");
 }, 25_000);
 
 test("explicit reset() clears a suspended turn", async () => {
