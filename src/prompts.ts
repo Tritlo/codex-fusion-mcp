@@ -257,6 +257,62 @@ export function magiDeliberatePrompt(opts: {
 }
 
 /**
+ * The "scribe" turn: read every advisor's independent opening and distil a
+ * **disagreement matrix** — only the points where the advisors actually differ —
+ * so later rounds can re-deliberate the contested claims instead of re-arguing
+ * everything. Surfaced to the host and fed into the targeted rounds.
+ */
+export function disagreementMatrixPrompt(opts: {
+  scribe: string;
+  host: string;
+  question: string;
+  openings: Array<{ name: string; text: string }>;
+}): string {
+  const positions = opts.openings.map((p) => `### ${p.name}\n${p.text.trim() || "(no usable answer)"}`).join("\n\n");
+  return assemble(
+    opts.scribe,
+    opts.host,
+    `<role>\nYou are the council scribe for this turn. Do not argue your own view — your job is to map where the advisors *disagree*, accurately and neutrally.\n</role>`,
+    `<question>\n${opts.question.trim()}\n</question>`,
+    `<openings>\n${positions}\n</openings>`,
+    `<output_contract>\nProduce a DISAGREEMENT MATRIX and nothing else:\n1. A markdown table: one row per genuinely contested claim, one column per advisor, each cell that advisor's stance in ≤6 words (or "—" if they didn't address it). Include only real disagreements; skip what they already agree on.\n2. Then a short list "Contested claims to resolve:" — the 1–3 most decision-relevant disagreements, each one line.\nIf the advisors substantively agree, say so in one line and give an empty/placeholder matrix. No preamble.\n</output_contract>`,
+    GROUNDING,
+  );
+}
+
+/**
+ * A targeted deliberation round: instead of re-arguing everything, each advisor
+ * works only the contested claims from the scribe's {@link disagreementMatrixPrompt}
+ * matrix, then closes with the CHANGED/VERDICT lines the settlement check reads.
+ */
+export function targetedDeliberatePrompt(opts: {
+  advisor: string;
+  host: string;
+  question: string;
+  context?: string;
+  hostTake?: string;
+  matrix: string;
+  round: number;
+  maxRounds: number;
+  grokStrengths?: boolean;
+}): string {
+  return assemble(
+    opts.advisor,
+    opts.host,
+    magiFrame(opts.host),
+    `<deliberation_round>\nThis is round ${opts.round} of up to ${opts.maxRounds}. Below is the council's disagreement matrix distilled from the openings. Engage ONLY the contested claims — for each, state your position, say where you now agree, and concede or hold with reasons. Don't re-argue points of agreement.\n</deliberation_round>`,
+    `<question>\n${opts.question.trim()}\n</question>`,
+    withContext(opts.context),
+    opts.hostTake && opts.hostTake.trim().length > 0 ? `<host_position>\n${opts.hostTake.trim()}\n</host_position>` : "",
+    `<disagreement_matrix>\n${opts.matrix.trim() || "(no matrix produced — resolve the key disagreements you see)"}\n</disagreement_matrix>`,
+    opts.grokStrengths ? GROK_STRENGTHS_COUNCIL : "",
+    DELIBERATION_ONLY,
+    `<output_contract>\nFor each contested claim: your resolved position in ≤2 sentences. Then end with EXACTLY these two final lines:\nCHANGED: <YES if your position moved from your previous answer, otherwise NO>\nVERDICT: CONSENSUS — <the one-sentence conclusion you now share> (or) VERDICT: OPEN — <the single most important point still unresolved>\n</output_contract>`,
+    GROUNDING,
+  );
+}
+
+/**
  * Ask Grok to generate an image or short video and save it into the workspace
  * (the `grok_generate` tool). Not a reviewer turn — it produces media, then
  * reports the path(s) so the host can surface the file.
