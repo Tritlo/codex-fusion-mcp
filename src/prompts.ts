@@ -51,8 +51,9 @@ const DELIBERATION_ONLY = `<deliberation_only>
 This is a READ-ONLY council deliberation. You MAY read any files and search/fetch to ground your view — read whatever you need directly (don't shell out for it). You may NOT modify files or run shell commands: writes and command execution are auto-declined here. Built-in web/X search is fine and encouraged where it helps. If something genuinely can't be inspected, say so briefly rather than trying to run a command.
 </deliberation_only>`;
 
-/** A focused question / second opinion on a specific decision. */
-export function consultPrompt(host: string, question: string, context?: string): string {
+/** A focused question / second opinion on a specific decision, from Codex (the
+ * `ask_codex` endpoint). Named for the member, not the `consult` council tool. */
+export function askCodexPrompt(host: string, question: string, context?: string): string {
   return assemble(
     CODEX,
     host,

@@ -16,9 +16,9 @@ import {
 } from "./session.ts";
 import {
   askClaudePrompt,
+  askCodexPrompt,
   askGrokPrompt,
   brainstormPrompt,
-  consultPrompt,
   explorePrompt,
   grokGeneratePrompt,
   magiAdvisorPrompt,
@@ -258,7 +258,7 @@ memberTools.codex.push(
     },
     ({ question, context, time }, extra) =>
       isActive("codex")
-        ? ask("codex", consultPrompt(hostName(), question, context), extra, "ask_codex", time)
+        ? ask("codex", askCodexPrompt(hostName(), question, context), extra, "ask_codex", time)
         : inactiveResult("codex"),
   ),
 );
@@ -433,7 +433,22 @@ server.registerTool(
   },
   ({ diff, paths, instructions, member, time }, extra) => {
     const build = (id: MemberId): string => reviewDiffPrompt(specs[id].promptName, hostName(), { diff, paths, instructions });
-    if (member === "council") return councilFanOut("review_diff", build, extra, time !== undefined ? time * 1000 : undefined);
+    if (member === "council") {
+      // Council mode is read-only — it can't run `git diff`. Without an explicit
+      // diff the advisors would have nothing to review, so refuse early rather
+      // than fan out to a guaranteed "I couldn't inspect the changes".
+      if (!diff || diff.trim().length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: 'review_diff with `member: "council"` needs an explicit `diff`: council mode is read-only and can\'t run `git diff`. Pass a diff, or use single-advisor review_diff (default Codex), which can run `git diff` via a permit.',
+            },
+          ],
+        };
+      }
+      return councilFanOut("review_diff", build, extra, time !== undefined ? time * 1000 : undefined);
+    }
     const target = advisorFor(member);
     if (!target) return inactiveResult(member!);
     return ask(target, build(target), extra, "review_diff", time);

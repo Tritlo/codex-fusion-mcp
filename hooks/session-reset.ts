@@ -6,7 +6,7 @@
 // drops the members' stale context before the next consult. A no-op for startup,
 // resume, and compact — those either coincide with a fresh server or are meant
 // to preserve continuity. Reuses src/reset.ts so the path matches the server's.
-import { renameSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { resetNonceFile } from "../src/reset.ts";
 
 interface SessionStartInput {
@@ -15,7 +15,8 @@ interface SessionStartInput {
   session_id?: string;
 }
 
-const input = JSON.parse(await Bun.stdin.text()) as SessionStartInput;
+// Read the hook payload from stdin (fd 0) — node-portable, no Bun global needed.
+const input = JSON.parse(readFileSync(0, "utf8")) as SessionStartInput;
 if (input.source === "clear" && input.cwd && input.session_id) {
   const file = resetNonceFile(input.cwd);
   const tmp = `${file}.${process.pid}.tmp`;
