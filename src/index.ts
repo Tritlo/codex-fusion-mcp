@@ -181,19 +181,28 @@ function inactiveResult(id: MemberId): ToolResult {
 /** Last line / tail of the streamed text so far, for a rolling live view. */
 const tail = (s: string): string => s.replace(/\s+/g, " ").trim().slice(-140);
 
-/** Streaming hooks that forward a member's output to the client as progress. */
-function streamHooks(extra: Extra, prefix = ""): Pick<AskOptions, "onText" | "onThought" | "onActivity"> {
+type Notify = (message: string) => void;
+
+/** A single monotonic progress channel for one MCP tool call. Concurrent council
+ * advisors must share *one* of these — MCP progress values are per-token and
+ * should increase, so a per-advisor counter would emit duplicate/out-of-order
+ * `progress` numbers on the same token. */
+function progressNotifier(extra: Extra): Notify {
   const token = extra._meta?.progressToken;
   let progress = 0;
-  let acc = "";
-  let thinking = "";
-  const notify = (message: string): void => {
+  return (message: string): void => {
     if (token === undefined) return;
     void extra.sendNotification({
       method: "notifications/progress",
       params: { progressToken: token, progress: ++progress, message },
     });
   };
+}
+
+/** Streaming hooks that forward a member's output via a (possibly shared) notifier. */
+function streamHooks(notify: Notify, prefix = ""): Pick<AskOptions, "onText" | "onThought" | "onActivity"> {
+  let acc = "";
+  let thinking = "";
   return {
     onText: (chunk) => {
       acc += chunk;
@@ -212,7 +221,7 @@ function ask(id: MemberId, prompt: string, extra: Extra, label: string, time?: n
   const session = sessions[id];
   const timeoutMs = time !== undefined ? time * 1000 : undefined;
   return session
-    .ask(prompt, { label, signal: extra.signal, timeoutMs, ...streamHooks(extra) })
+    .ask(prompt, { label, signal: extra.signal, timeoutMs, ...streamHooks(progressNotifier(extra)) })
     .then((outcome) => renderOutcome(outcome, session.name))
     .catch((err: unknown) => renderMemberError(session.name, err, session.loginHint));
 }
@@ -577,6 +586,7 @@ async function councilTurn(
   label: string,
   prefix: string,
   extra: Extra,
+  notify: Notify,
   timeoutMs: number | undefined,
   getSession: SessionFor,
 ): Promise<{ name: string; markup: string; text: string }> {
@@ -587,7 +597,7 @@ async function councilTurn(
       signal: extra.signal,
       timeoutMs,
       onAskPermission: "read-only",
-      ...streamHooks(extra, prefix),
+      ...streamHooks(notify, prefix),
     });
     const result = outcome.type === "answer" ? outcome.result : null;
     return { name, markup: renderVoice(name, result), text: result?.text ?? "" };
@@ -628,9 +638,10 @@ async function councilFanOut(
   const warning = unknownHostWarning();
   if (warning) sections.push(warning);
 
+  const notify = progressNotifier(extra); // one shared channel for all concurrent advisors
   const voices = await Promise.all(
     activeIds().map((id) =>
-      councilTurn(id, buildPrompt(id), label, `${specs[id].name} `, extra, timeoutMs, getSession),
+      councilTurn(id, buildPrompt(id), label, `${specs[id].name} `, extra, notify, timeoutMs, getSession),
     ),
   );
   sections.push(...voices.map((v) => v.markup));
@@ -690,6 +701,7 @@ async function runMagi(args: MagiArgs, extra: Extra): Promise<ToolResult> {
     const warning = unknownHostWarning();
     if (warning) blocks.push(warning);
 
+    const notify = progressNotifier(extra); // one shared channel across all rounds + advisors
     let prev: Array<{ name: string; text: string }> = [];
     let outcome = "";
 
@@ -718,7 +730,7 @@ async function runMagi(args: MagiArgs, extra: Extra): Promise<ToolResult> {
             });
 
       const voices = await Promise.all(
-        active.map((id) => councilTurn(id, buildPrompt(id), "consult", `${specs[id].name} R${round} `, extra, timeoutMs, getSession)),
+        active.map((id) => councilTurn(id, buildPrompt(id), "consult", `${specs[id].name} R${round} `, extra, notify, timeoutMs, getSession)),
       );
       blocks.push(
         `## Round ${round}${round === 1 ? " — independent openings" : ""}\n\n${voices.map((v) => v.markup).join("\n\n---\n\n")}`,
@@ -793,7 +805,7 @@ server.registerTool(
           label: "permit",
           signal: extra.signal,
           timeoutMs: time !== undefined ? time * 1000 : undefined,
-          ...streamHooks(extra),
+          ...streamHooks(progressNotifier(extra)),
         },
         note,
       )

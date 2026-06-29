@@ -105,7 +105,7 @@ test("a new ask abandons a suspended turn cleanly (settles the held permission)"
   const o2 = await s.ask("write FOO again");
   expect(o2.type).toBe("permission");
   expect(s.isAwaitingPermission()).toBe(true);
-});
+}, 25_000); // two cold subprocess spawns (suspend, then reset+respawn) — generous under load
 
 test("explicit reset() clears a suspended turn", async () => {
   const s = makeSession("permission");
@@ -132,7 +132,9 @@ test("idle timeout aborts a silent, wedged turn", async () => {
   const out = await s.ask("hang", { timeoutMs: 150 });
   expect(out.type).toBe("answer");
   if (out.type === "answer") expect(out.result.stopReason).toBe("timeout");
-}, 10_000);
+  // Generous per-test deadline: the behavior is ~1.6s (150ms idle + hard-stop
+  // grace), but a heavily-loaded box can stretch wall-clock — don't let load flake it.
+}, 25_000);
 
 test("external cancel stops a turn", async () => {
   const s = makeSession("graceful-cancel");
@@ -141,7 +143,7 @@ test("external cancel stops a turn", async () => {
   const out = await s.ask("go", { signal: ac.signal });
   expect(out.type).toBe("answer");
   if (out.type === "answer") expect(out.result.stopReason).toBe("cancelled");
-}, 10_000);
+}, 25_000);
 
 test("a child that dies mid-turn fails fast, not after the idle timeout", async () => {
   const s = makeSession("crash");
@@ -156,6 +158,34 @@ test("a child that dies mid-turn fails fast, not after the idle timeout", async 
   // Woken by the child's exit, not the idle timeout. The bound is generous (vs the
   // 30s idle window) so a loaded CI box can't flake it while still proving the point.
   expect(performance.now() - started).toBeLessThan(15_000);
+}, 25_000);
+
+test("a one-shot allow granted only as allow_always is surfaced in the log", async () => {
+  const s = makeSession("permission-always-only");
+  const o1 = await s.ask("write FOO");
+  expect(o1.type).toBe("permission");
+  const o2 = await s.permit(true);
+  expect(o2.type).toBe("answer");
+  if (o2.type === "answer") {
+    expect(o2.result.log.join("\n")).toContain("allow_always");
+    expect(o2.result.text).toBe("SELECTED:always");
+  }
+});
+
+test("a child that exits right after a clean turn doesn't corrupt the next turn", async () => {
+  const s = makeSession("answer-and-exit");
+  const o1 = await s.ask("first");
+  expect(o1.type).toBe("answer");
+  if (o1.type === "answer") expect(o1.result.text).toBe("ANSWERED-THEN-EXIT");
+  // Wait until the child has *actually* exited (deterministic — not a fixed sleep
+  // that could race the post-success exit into the next turn), so the stale `failed`
+  // event is sitting in the queue when we start over.
+  const deadline = performance.now() + 5_000;
+  while (s.status().childAlive && performance.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+  expect(s.status().childAlive).toBe(false);
+  const o2 = await s.ask("second"); // must respawn cleanly, not trip on the stale event
+  expect(o2.type).toBe("answer");
+  if (o2.type === "answer") expect(o2.result.text).toBe("ANSWERED-THEN-EXIT");
 }, 25_000);
 
 test("turns serialize behind the gate", async () => {
@@ -181,4 +211,4 @@ test("a changed reset nonce drops the session and respawns", async () => {
   } finally {
     delete process.env.FAKE_ACP_SESSIONS_FILE;
   }
-});
+}, 25_000); // two cold subprocess spawns (initial, then reset+respawn) — generous under load

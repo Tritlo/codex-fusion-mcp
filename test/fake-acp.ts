@@ -60,15 +60,15 @@ new AgentSideConnection((conn): Agent => {
           sessionId,
           update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text } },
         });
+      const askWith = (
+        toolCall: RequestPermissionRequest["toolCall"],
+        options: RequestPermissionRequest["options"],
+      ) => conn.requestPermission({ sessionId, toolCall, options });
       const ask = (toolCall: RequestPermissionRequest["toolCall"]) =>
-        conn.requestPermission({
-          sessionId,
-          toolCall,
-          options: [
-            { optionId: "allow", kind: "allow_once", name: "Allow" },
-            { optionId: "reject", kind: "reject_once", name: "Reject" },
-          ],
-        });
+        askWith(toolCall, [
+          { optionId: "allow", kind: "allow_once", name: "Allow" },
+          { optionId: "reject", kind: "reject_once", name: "Reject" },
+        ]);
       const writeCall = { toolCallId: "w1", kind: "edit", title: "write FOO", locations: [{ path: `${process.cwd()}/FOO` }] } as const;
 
       switch (scenario) {
@@ -81,6 +81,24 @@ new AgentSideConnection((conn): Agent => {
           const res = await ask(writeCall);
           const ok = res.outcome.outcome === "selected" && res.outcome.optionId === "allow";
           await say(ok ? "WROTE-FOO" : "BLOCKED-FOO");
+          return { stopReason: "end_turn" };
+        }
+        case "permission-always-only": {
+          // The agent offers ONLY allow_always (no one-shot) — exercises the
+          // pickOption footgun guard, which should grant but log a note.
+          const res = await askWith(writeCall, [
+            { optionId: "always", kind: "allow_always", name: "Always allow" },
+            { optionId: "reject", kind: "reject_once", name: "Reject" },
+          ]);
+          await say(res.outcome.outcome === "selected" ? `SELECTED:${res.outcome.optionId}` : "CANCELLED");
+          return { stopReason: "end_turn" };
+        }
+        case "answer-and-exit": {
+          // A clean turn, then the process exits shortly after — a persistent ACP
+          // agent shouldn't, but if it does it must not corrupt the completed turn
+          // or the next one.
+          await say("ANSWERED-THEN-EXIT");
+          setTimeout(() => process.exit(0), 30);
           return { stopReason: "end_turn" };
         }
         case "readonly-probe": {

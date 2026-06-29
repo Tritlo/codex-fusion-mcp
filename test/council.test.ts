@@ -9,7 +9,12 @@ test("parseVerdict reads the VERDICT and CHANGED lines (tolerant of markup)", ()
   expect(parseVerdict("no markers here")).toEqual({ kind: null, changed: null });
 });
 
-test("settled when every answering advisor reports CONSENSUS", () => {
+test("parseVerdict takes the LAST verdict, so a quoted earlier one doesn't win", () => {
+  const text = "You said VERDICT: CONSENSUS earlier, but I disagree.\nCHANGED: NO\nVERDICT: OPEN — unresolved";
+  expect(parseVerdict(text)).toEqual({ kind: "open", changed: false });
+});
+
+test("settled only when EVERY active advisor answered CONSENSUS", () => {
   const s = councilSettlement(2, [
     { name: "Codex", text: "…\nVERDICT: CONSENSUS — yes" },
     { name: "Grok", text: "…\nCHANGED: NO\nVERDICT: CONSENSUS — yes" },
@@ -18,12 +23,13 @@ test("settled when every answering advisor reports CONSENSUS", () => {
   if (s.done) expect(s.kind).toBe("settled");
 });
 
-test("an errored/empty advisor doesn't poison the decision, but an all-empty round isn't settled", () => {
-  const s = councilSettlement(2, [
+test("partial participation never settles (no quorum) — fixes the round-1 overclaim", () => {
+  // One advisor errored/returned nothing: we must NOT declare "all advisors agreed".
+  const partial = councilSettlement(2, [
     { name: "Codex", text: "" },
     { name: "Grok", text: "VERDICT: CONSENSUS — yes" },
   ]);
-  expect(s.done).toBe(true); // decided among the advisors that actually answered
+  expect(partial.done).toBe(false);
 
   const allEmpty = councilSettlement(2, [
     { name: "Codex", text: "" },

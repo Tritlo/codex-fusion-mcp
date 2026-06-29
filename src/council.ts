@@ -13,12 +13,19 @@ export interface Verdict {
   changed: boolean | null;
 }
 
-/** Parse the trailing `CHANGED:`/`VERDICT:` lines an advisor emits in a deliberation round. */
+/**
+ * Parse the trailing `CHANGED:`/`VERDICT:` lines an advisor emits in a
+ * deliberation round. Takes the **last** occurrence of each, so an advisor that
+ * *quotes* an earlier verdict (e.g. "you said VERDICT: CONSENSUS, but…") before
+ * its own closing line is read by its real conclusion, not the quote.
+ */
 export function parseVerdict(text: string): Verdict {
-  const v = text.match(/^[\s>*_-]*\**\s*VERDICT:\s*\**\s*(CONSENSUS|OPEN)\b/im);
-  const kind = v ? (v[1]!.toUpperCase() === "CONSENSUS" ? "consensus" : "open") : null;
-  const c = text.match(/^[\s>*_-]*\**\s*CHANGED:\s*\**\s*(YES|NO)\b/im);
-  const changed = c ? c[1]!.toUpperCase() === "YES" : null;
+  const verdicts = [...text.matchAll(/^[\s>*_-]*\**\s*VERDICT:\s*\**\s*(CONSENSUS|OPEN)\b/gim)];
+  const lastVerdict = verdicts.at(-1);
+  const kind = lastVerdict ? (lastVerdict[1]!.toUpperCase() === "CONSENSUS" ? "consensus" : "open") : null;
+  const changes = [...text.matchAll(/^[\s>*_-]*\**\s*CHANGED:\s*\**\s*(YES|NO)\b/gim)];
+  const lastChange = changes.at(-1);
+  const changed = lastChange ? lastChange[1]!.toUpperCase() === "YES" : null;
   return { kind, changed };
 }
 
@@ -34,24 +41,26 @@ export type Settlement = { done: false } | { done: true; kind: "settled" | "stal
 /**
  * Decide whether a deliberation round has converged, from the advisors' verdicts.
  *
- * Only advisors that actually produced an answer are counted — an errored or empty
- * advisor never makes the council look settled *or* stalled (the prior string-compare
- * detector could be poisoned by repeated empty/error text). Convergence is the
+ * Convergence is a council-wide claim, so it requires **full participation**: every
+ * active advisor (`voices`, one entry per advisor, errored ones carrying empty text)
+ * must have actually answered this round. If any advisor dropped, we keep going
+ * rather than declare "all advisors agreed" when one never spoke — the earlier
+ * version could settle (or stalemate) on a single voice. Convergence is the
  * advisors' own self-report, not a comparison of wording:
  *
- * - **settled** — at least one advisor answered and *every* answering advisor's
- *   verdict is CONSENSUS.
- * - **stalemate** — every answering advisor explicitly reports `CHANGED: no`, i.e.
- *   no one's position moved this round.
+ * - **settled** — all advisors answered and *every* verdict is CONSENSUS.
+ * - **stalemate** — all advisors answered and *every* one reports `CHANGED: no`
+ *   (no position moved this round).
  *
- * Anything else (including a model that omits the lines) keeps the debate going,
- * which is the safe default.
+ * Anything else (a model that omits the lines, or a partial round) keeps the debate
+ * going, which is the safe default; the round cap is the backstop.
  */
 export function councilSettlement(round: number, voices: CouncilVoice[]): Settlement {
+  const total = voices.length;
   const answered = voices.filter((v) => v.text.trim().length > 0).map((v) => parseVerdict(v.text));
-  if (answered.length === 0) return { done: false };
+  if (total === 0 || answered.length < total) return { done: false }; // need every advisor's voice
   if (answered.every((v) => v.kind === "consensus")) {
-    return { done: true, kind: "settled", message: `✅ **Settled** — all advisors reached consensus after ${round} rounds.` };
+    return { done: true, kind: "settled", message: `✅ **Settled** — all ${total} advisors reached consensus after ${round} rounds.` };
   }
   if (answered.every((v) => v.changed === false)) {
     return { done: true, kind: "stalemate", message: `⚖️ **Stalemate** — no advisor's position moved in round ${round}.` };

@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
   ClientSideConnection,
@@ -19,6 +19,49 @@ import { resetNonceFile } from "./reset.ts";
 
 /** Grace after an ACP cancel before we hard-stop a wedged turn and respawn. */
 const HARD_STOP_GRACE_MS = 1500;
+
+/**
+ * SIGTERM a child, then escalate to SIGKILL after the grace if it's still alive,
+ * so a member that ignores SIGTERM can't survive as an orphan. The timer is
+ * `unref`'d (it never keeps the host process alive) and cleared if the child
+ * exits in time.
+ */
+/**
+ * Resolve symlinks in a path for containment checks, tolerating a target that
+ * doesn't exist yet (a write to a new file): realpath the nearest existing
+ * ancestor and re-append the remaining segments. So an in-workspace symlink that
+ * points outside the workspace resolves to its real location and can't be mistaken
+ * for an in-workspace path by a later lexical containment check.
+ */
+function realPathBestEffort(p: string): string {
+  let cur = resolve(p);
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      return tail.length ? join(realpathSync(cur), ...tail) : realpathSync(cur);
+    } catch {
+      const parent = dirname(cur);
+      if (parent === cur) return resolve(p); // hit the root without resolving — lexical fallback
+      tail.unshift(basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+function hardKill(child: ChildProcess): void {
+  child.kill(); // SIGTERM
+  const sigkill = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }
+  }, HARD_STOP_GRACE_MS);
+  if (typeof sigkill.unref === "function") sigkill.unref();
+  child.once("exit", () => clearTimeout(sigkill));
+}
 
 /**
  * ACP `sessionUpdate` kinds that count as the member making progress, and so reset
@@ -216,14 +259,7 @@ export class AcpSession {
    * outside the sandbox and escape the read scope. */
   private isReadable(abs: string): boolean {
     if (this.config.allowExternalReads) return true;
-    const real = (p: string): string => {
-      try {
-        return realpathSync(p);
-      } catch {
-        return resolve(p); // path (or a parent) doesn't exist yet — fall back to lexical
-      }
-    };
-    const rel = relative(real(this.config.workspaceRoot), real(abs));
+    const rel = relative(realPathBestEffort(this.config.workspaceRoot), realPathBestEffort(abs));
     return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
   }
 
@@ -233,7 +269,15 @@ export class AcpSession {
         // Ignore late requests from a superseded session (after a respawn).
         if (params.sessionId !== this.sessionId) return { outcome: { outcome: "cancelled" } };
 
-        const verdict = guardianDecision(params.toolCall, this.config);
+        // Resolve symlinks in the requested locations before the (pure) policy
+        // sees them, so an in-workspace symlink to outside can't be auto-allowed
+        // as "inside the workspace". The human-facing label keeps the original path.
+        const locations = params.toolCall.locations;
+        const resolvedCall =
+          locations && locations.length > 0
+            ? { ...params.toolCall, locations: locations.map((l) => ({ ...l, path: realPathBestEffort(l.path) })) }
+            : params.toolCall;
+        const verdict = guardianDecision(resolvedCall, this.config);
         const label = describePermission(params.toolCall);
         if (verdict.decision === "allow") {
           const note = `auto-allowed: ${label}`;
@@ -421,23 +465,29 @@ export class AcpSession {
       this.starting = this.start();
       this.starting.catch(() => {}); // avoid an unhandled rejection before the await below
     }
+    const p = this.starting;
     try {
-      await this.starting;
+      await p;
     } catch (err) {
-      this.starting = undefined; // clear the poisoned promise so a later call can retry
+      // Only clear *our* poisoned promise: a superseded startup that rejects late
+      // must not null a newer start() that a subsequent call already kicked off.
+      if (this.starting === p) this.starting = undefined;
       throw err;
     }
   }
 
   /**
-   * Start the session, giving up if `signal` aborts or startup exceeds the turn
-   * timeout (a wedged `initialize`/`newSession` must not pin the gate). Returns
+   * Start the session, giving up if `signal` aborts or startup exceeds the
+   * **default** turn timeout (a wedged `initialize`/`newSession` must not pin the
+   * gate). Startup uses `config.turnTimeoutMs`, not the per-call idle override:
+   * a short per-call `time` is meant to bound *silence during a turn*, and must
+   * not starve a cold subprocess launch (e.g. a first-run `bunx` fetch). Returns
    * false if cancelled; throws on startup failure or timeout.
    */
-  private async ensureStartedAbortable(signal?: AbortSignal, timeoutMs?: number): Promise<boolean> {
+  private async ensureStartedAbortable(signal?: AbortSignal): Promise<boolean> {
     if (this.sessionId) return true;
     if (signal?.aborted) return false;
-    const limit = timeoutMs ?? this.config.turnTimeoutMs;
+    const limit = this.config.turnTimeoutMs;
     const startup = this.ensureStarted();
     startup.catch(() => {}); // we may stop awaiting it below; don't leak a rejection
     return await new Promise<boolean>((resolve, reject) => {
@@ -561,9 +611,8 @@ export class AcpSession {
     this.turnStart = Date.now();
     this.eventQueue = [];
     this.eventWaiter = undefined;
-    const timeoutMs = opts.timeoutMs ?? this.config.turnTimeoutMs;
     try {
-      const ok = await this.ensureStartedAbortable(opts.signal, timeoutMs);
+      const ok = await this.ensureStartedAbortable(opts.signal);
       if (!ok) {
         const result = this.snapshot("cancelled");
         this.finish(id);
@@ -752,19 +801,7 @@ export class AcpSession {
     this.conn = undefined;
     this.sessionId = undefined;
     this.starting = undefined;
-    if (!child) return;
-    child.kill(); // SIGTERM
-    const sigkill = setTimeout(() => {
-      if (child.exitCode === null && child.signalCode === null) {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          /* already gone */
-        }
-      }
-    }, HARD_STOP_GRACE_MS);
-    if (typeof sigkill.unref === "function") sigkill.unref(); // don't keep the process alive
-    child.once("exit", () => clearTimeout(sigkill));
+    if (child) hardKill(child);
   }
 
   /** Current health, without starting a session. */
@@ -786,8 +823,9 @@ export class AcpSession {
     };
   }
 
-  /** Terminate the member's ACP subprocess. */
+  /** Terminate the member's ACP subprocess (hard-stop, so a SIGTERM-ignoring
+   * child — e.g. an ephemeral `fresh` member or one alive at shutdown — can't leak). */
   dispose(): void {
-    this.child?.kill();
+    if (this.child) hardKill(this.child);
   }
 }
