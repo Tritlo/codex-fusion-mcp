@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
   ClientSideConnection,
@@ -9,6 +9,7 @@ import {
   type Client,
   type PermissionOption,
   type RequestPermissionResponse,
+  type SessionConfigOption,
   type SessionNotification,
   type Usage,
 } from "@agentclientprotocol/sdk";
@@ -19,6 +20,49 @@ import { resetNonceFile } from "./reset.ts";
 
 /** Grace after an ACP cancel before we hard-stop a wedged turn and respawn. */
 const HARD_STOP_GRACE_MS = 1500;
+
+/**
+ * SIGTERM a child, then escalate to SIGKILL after the grace if it's still alive,
+ * so a member that ignores SIGTERM can't survive as an orphan. The timer is
+ * `unref`'d (it never keeps the host process alive) and cleared if the child
+ * exits in time.
+ */
+/**
+ * Resolve symlinks in a path for containment checks, tolerating a target that
+ * doesn't exist yet (a write to a new file): realpath the nearest existing
+ * ancestor and re-append the remaining segments. So an in-workspace symlink that
+ * points outside the workspace resolves to its real location and can't be mistaken
+ * for an in-workspace path by a later lexical containment check.
+ */
+function realPathBestEffort(p: string): string {
+  let cur = resolve(p);
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      return tail.length ? join(realpathSync(cur), ...tail) : realpathSync(cur);
+    } catch {
+      const parent = dirname(cur);
+      if (parent === cur) return resolve(p); // hit the root without resolving — lexical fallback
+      tail.unshift(basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+function hardKill(child: ChildProcess): void {
+  child.kill(); // SIGTERM
+  const sigkill = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }
+  }, HARD_STOP_GRACE_MS);
+  if (typeof sigkill.unref === "function") sigkill.unref();
+  child.once("exit", () => clearTimeout(sigkill));
+}
 
 /**
  * ACP `sessionUpdate` kinds that count as the member making progress, and so reset
@@ -70,6 +114,8 @@ export interface AskOptions {
   onActivity?: (note: string) => void;
   /** Override the idle timeout (ms) for this turn; falls back to the config default. */
   timeoutMs?: number;
+  /** Optional ACP model selector value/name to use before sending this turn. */
+  model?: string;
   /**
    * How to handle a guardian "ask" verdict for this turn. `"suspend"` (the
    * default) hands the decision back to Claude as a permission and pauses the
@@ -90,6 +136,9 @@ interface PendingPermission {
   description: string;
   /** Resolve the held-open ACP request with Claude's decision. */
   decide: (allow: boolean) => void;
+  /** Settle the held-open ACP request as `cancelled` (e.g. the turn is reset
+   * before the host decides) so it isn't left dangling. */
+  cancel: () => void;
 }
 
 /**
@@ -114,10 +163,30 @@ export interface SessionStatus {
   acpCommand: string;
   guardian: { externalReads: boolean; writes: boolean; commands: boolean };
   sessionStarted: boolean;
+  /** Current ACP model selector value, when the member reports one. */
+  currentModel?: string;
   childAlive: boolean;
   /** Description of a permission currently awaiting Claude's decision, if any. */
   pendingPermission?: string;
   stderrTail: string;
+}
+
+/** One model choice reported by a member's ACP session config. */
+export interface ModelChoice {
+  value: string;
+  name: string;
+  description?: string;
+  group?: string;
+  current: boolean;
+}
+
+/** Model selector inventory for one council member. */
+export interface ModelInventory {
+  name: string;
+  sessionStarted: boolean;
+  selector?: { id: string; name: string };
+  currentModel?: string;
+  models: ModelChoice[];
 }
 
 /**
@@ -138,6 +207,7 @@ export class AcpSession {
   private conn?: ClientSideConnection;
   private sessionId?: string;
   private starting?: Promise<void>;
+  private configOptions: SessionConfigOption[] = [];
   private readonly stderr: string[] = [];
 
   // In-flight turn state (safe because turns are serialized behind the gate).
@@ -164,6 +234,10 @@ export class AcpSession {
   // Serializes turns; the holder releases it when the turn fully ends.
   private turnGate: Promise<void> = Promise.resolve();
   private releaseGate?: () => void;
+  // How many ask() calls are queued waiting for the gate. A turn that would
+  // suspend on a permission while someone is waiting abandons instead of parking,
+  // so the queued ask can't wedge behind a turn that may never be permitted.
+  private gateWaiters = 0;
   // Generation token: bumped per turn so stale async work (a force-reset turn's
   // background prompt, or a superseded segment) can't mutate a newer turn.
   private turnId = 0;
@@ -192,27 +266,133 @@ export class AcpSession {
     return this.awaitingDecision !== undefined;
   }
 
+  private modelOption(): SessionConfigOption | undefined {
+    const modelOptions = this.configOptions.filter((o) => o.type === "select" && o.category === "model");
+    return (
+      modelOptions[0] ??
+      this.configOptions.find(
+        (o) => o.type === "select" && `${o.id} ${o.name} ${o.category ?? ""}`.toLowerCase().includes("model"),
+      )
+    );
+  }
+
+  private modelChoices(option: SessionConfigOption): ModelChoice[] {
+    if (option.type !== "select") return [];
+    return option.options.flatMap((entry) => {
+      if ("group" in entry) {
+        return entry.options.map((o) => ({
+          value: o.value,
+          name: o.name,
+          description: o.description ?? undefined,
+          group: entry.name,
+          current: o.value === option.currentValue,
+        }));
+      }
+      return [
+        {
+          value: entry.value,
+          name: entry.name,
+          description: entry.description ?? undefined,
+          current: entry.value === option.currentValue,
+        },
+      ];
+    });
+  }
+
+  private modelInventory(): ModelInventory {
+    const option = this.modelOption();
+    const choices = option ? this.modelChoices(option) : [];
+    const current = choices.find((c) => c.current);
+    return {
+      name: this.member.name,
+      sessionStarted: this.sessionId !== undefined,
+      selector: option ? { id: option.id, name: option.name } : undefined,
+      currentModel: current?.value ?? (option?.type === "select" ? option.currentValue : undefined),
+      models: choices,
+    };
+  }
+
+  private async selectModel(model: string | undefined): Promise<void> {
+    const requested = model?.trim();
+    if (!requested) return;
+    const option = this.modelOption();
+    if (!option) throw new Error(`${this.member.name} does not report an ACP model selector`);
+    const choices = this.modelChoices(option);
+    const requestedLower = requested.toLowerCase();
+    const choice =
+      choices.find((c) => c.value === requested || c.name === requested) ??
+      choices.find((c) => c.value.toLowerCase() === requestedLower || c.name.toLowerCase() === requestedLower);
+    if (!choice) {
+      const available = choices.length > 0 ? choices.map((c) => c.value).join(", ") : "(none reported)";
+      throw new Error(`${this.member.name} does not report model ${requested}. Available models: ${available}`);
+    }
+    if (choice.value === option.currentValue) return;
+    if (!this.conn || !this.sessionId) throw new Error(`${this.member.name} session is not started`);
+    this.turnLog.push(`model selected: ${choice.value}`);
+    this.turnOnActivity?.(`model: ${choice.value}`);
+    const updated = await this.conn.setSessionConfigOption({
+      sessionId: this.sessionId,
+      configId: option.id,
+      value: choice.value,
+    });
+    this.configOptions = updated.configOptions ?? [];
+  }
+
+  /** Start the member if needed and return its ACP-reported model selector. */
+  async availableModels(signal?: AbortSignal): Promise<ModelInventory> {
+    this.checkSessionEpoch();
+    const ok = await this.ensureStartedAbortable(signal);
+    if (!ok) throw new Error(`${this.member.name} startup cancelled`);
+    return this.modelInventory();
+  }
+
   private pickOption(options: PermissionOption[], allow: boolean): PermissionOption | undefined {
     const wanted: Array<PermissionOption["kind"]> = allow
       ? ["allow_once", "allow_always"]
       : ["reject_once", "reject_always"];
-    return wanted.map((kind) => options.find((o) => o.kind === kind)).find((o) => o !== undefined);
+    const chosen = wanted.map((kind) => options.find((o) => o.kind === kind)).find((o) => o !== undefined);
+    // A one-shot allow that the agent only offers as `allow_always` would silently
+    // become a standing grant for this session. Honor it (denying would block a
+    // host "allow" entirely), but surface it so the host isn't surprised.
+    if (chosen && allow && chosen.kind === "allow_always") {
+      const note = "note: agent offered no one-shot allow; granted as allow_always (persists this session)";
+      this.turnLog.push(note);
+      this.turnOnActivity?.(note);
+    }
+    return chosen;
   }
 
-  /** True if reading `abs` is allowed: inside the workspace, or external reads enabled. */
+  /** True if reading `abs` is allowed: inside the workspace, or external reads enabled.
+   * Compares *real* (symlink-resolved) paths so an in-workspace symlink can't point
+   * outside the sandbox and escape the read scope. */
   private isReadable(abs: string): boolean {
     if (this.config.allowExternalReads) return true;
-    const rel = relative(this.config.workspaceRoot, abs);
+    const rel = relative(realPathBestEffort(this.config.workspaceRoot), realPathBestEffort(abs));
     return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
   }
 
   private buildClient(): Client {
+    // Bind this client to the child it serves. After a reset/respawn the old child
+    // may briefly outlive its SIGTERM (until the SIGKILL grace) and emit late
+    // messages; reject them by *identity*, not just sessionId — an agent (or the
+    // test fake) could reuse a session id across sessions, and a stale chunk must
+    // never bleed into the new turn's state.
+    const owner = this.child;
+    const isStale = (sessionId: string): boolean => this.child !== owner || sessionId !== this.sessionId;
     return {
       requestPermission: async (params): Promise<RequestPermissionResponse> => {
-        // Ignore late requests from a superseded session (after a respawn).
-        if (params.sessionId !== this.sessionId) return { outcome: { outcome: "cancelled" } };
+        // Ignore late requests from a superseded session/child (after a respawn).
+        if (isStale(params.sessionId)) return { outcome: { outcome: "cancelled" } };
 
-        const verdict = guardianDecision(params.toolCall, this.config);
+        // Resolve symlinks in the requested locations before the (pure) policy
+        // sees them, so an in-workspace symlink to outside can't be auto-allowed
+        // as "inside the workspace". The human-facing label keeps the original path.
+        const locations = params.toolCall.locations;
+        const resolvedCall =
+          locations && locations.length > 0
+            ? { ...params.toolCall, locations: locations.map((l) => ({ ...l, path: realPathBestEffort(l.path) })) }
+            : params.toolCall;
+        const verdict = guardianDecision(resolvedCall, this.config);
         const label = describePermission(params.toolCall);
         if (verdict.decision === "allow") {
           const note = `auto-allowed: ${label}`;
@@ -255,6 +435,7 @@ export class AcpSession {
                   : { outcome: { outcome: "cancelled" } },
               );
             },
+            cancel: () => resolveAcp({ outcome: { outcome: "cancelled" } }),
           };
           this.pushEvent({ kind: "permission", permission });
         });
@@ -263,7 +444,7 @@ export class AcpSession {
         // Read-only client filesystem: serve reads scoped to the workspace (or
         // anywhere when external reads are enabled). Never writes. This gives the
         // member a non-shell read path that works even in read-only council mode.
-        if (params.sessionId !== this.sessionId) throw new Error("read for a superseded session");
+        if (isStale(params.sessionId)) throw new Error("read for a superseded session");
         const abs = resolve(params.path);
         if (!this.isReadable(abs)) {
           throw new Error(`read denied: ${params.path} is outside the workspace (set CODEX_FUSION_/MAGI_COUNCIL_ALLOW_EXTERNAL_READS to allow)`);
@@ -281,7 +462,7 @@ export class AcpSession {
         return { content };
       },
       sessionUpdate: async (params: SessionNotification): Promise<void> => {
-        if (params.sessionId !== this.sessionId) return; // drop stale-session updates
+        if (isStale(params.sessionId)) return; // drop updates from a stale session/child
         const u = params.update;
         // Real output (text, reasoning, tool progress, plan) resets the idle
         // timeout. Housekeeping updates (usage/mode/config/commands/session-info)
@@ -306,6 +487,9 @@ export class AcpSession {
             // thinking (the client resets its timeout on progress). Never fold it
             // into turnText, which must stay the member's final answer.
             if (u.content.type === "text") this.turnOnThought?.(u.content.text);
+            break;
+          case "config_option_update":
+            this.configOptions = u.configOptions;
             break;
           case "tool_call": {
             const note = `tool: ${u.title ?? u.kind ?? u.toolCallId}`;
@@ -334,7 +518,12 @@ export class AcpSession {
       this.stderr.push(d.toString());
       if (this.stderr.length > 50) this.stderr.shift();
     });
-    // If the agent dies, drop the session so the next turn respawns it.
+    // If the agent dies, drop the session so the next turn respawns it. When
+    // `this.child === child` the death was *unexpected* (we null `this.child`
+    // before killing in forceReset/startup-cleanup, so those paths don't match);
+    // wake any waiting turn with a failure so it fails fast instead of sitting
+    // out the idle timeout. A stale event with no turn in flight is harmless —
+    // ask() clears the queue before launching.
     child.on("exit", (code, signal) => {
       this.stderr.push(`${this.member.name} exited (code=${code} signal=${signal})`);
       if (this.child === child) {
@@ -342,6 +531,11 @@ export class AcpSession {
         this.conn = undefined;
         this.sessionId = undefined;
         this.starting = undefined;
+        this.configOptions = [];
+        this.pushEvent({
+          kind: "failed",
+          error: new Error(`${this.member.name} exited unexpectedly (code=${code} signal=${signal})`),
+        });
       }
     });
     if (!child.stdin || !child.stdout) throw new Error(`${this.member.name}: no stdio pipes`);
@@ -367,6 +561,7 @@ export class AcpSession {
       // while newSession was in flight, don't bind a session to a dead child.
       if (this.child !== child) throw new Error(`${this.member.name} startup superseded`);
       this.sessionId = session.sessionId;
+      this.configOptions = session.configOptions ?? [];
     } catch (err) {
       const tail = this.stderr.join("").trim().slice(-600);
       // Don't leak the half-started subprocess; reset so the next call respawns.
@@ -390,23 +585,29 @@ export class AcpSession {
       this.starting = this.start();
       this.starting.catch(() => {}); // avoid an unhandled rejection before the await below
     }
+    const p = this.starting;
     try {
-      await this.starting;
+      await p;
     } catch (err) {
-      this.starting = undefined; // clear the poisoned promise so a later call can retry
+      // Only clear *our* poisoned promise: a superseded startup that rejects late
+      // must not null a newer start() that a subsequent call already kicked off.
+      if (this.starting === p) this.starting = undefined;
       throw err;
     }
   }
 
   /**
-   * Start the session, giving up if `signal` aborts or startup exceeds the turn
-   * timeout (a wedged `initialize`/`newSession` must not pin the gate). Returns
+   * Start the session, giving up if `signal` aborts or startup exceeds the
+   * **default** turn timeout (a wedged `initialize`/`newSession` must not pin the
+   * gate). Startup uses `config.turnTimeoutMs`, not the per-call idle override:
+   * a short per-call `time` is meant to bound *silence during a turn*, and must
+   * not starve a cold subprocess launch (e.g. a first-run `bunx` fetch). Returns
    * false if cancelled; throws on startup failure or timeout.
    */
-  private async ensureStartedAbortable(signal?: AbortSignal, timeoutMs?: number): Promise<boolean> {
+  private async ensureStartedAbortable(signal?: AbortSignal): Promise<boolean> {
     if (this.sessionId) return true;
     if (signal?.aborted) return false;
-    const limit = timeoutMs ?? this.config.turnTimeoutMs;
+    const limit = this.config.turnTimeoutMs;
     const startup = this.ensureStarted();
     startup.catch(() => {}); // we may stop awaiting it below; don't leak a rejection
     return await new Promise<boolean>((resolve, reject) => {
@@ -521,7 +722,12 @@ export class AcpSession {
     // Key on awaitingDecision (the suspended marker), not releaseGate, which is
     // set for every in-flight turn and would wrongly abandon a running one.
     if (this.awaitingDecision) this.reset();
-    await this.acquireGate();
+    this.gateWaiters++;
+    try {
+      await this.acquireGate();
+    } finally {
+      this.gateWaiters--;
+    }
     const id = ++this.turnId;
     this.turnLabel = opts.label ?? "turn";
     this.turnReadOnly = opts.onAskPermission === "read-only";
@@ -530,14 +736,14 @@ export class AcpSession {
     this.turnStart = Date.now();
     this.eventQueue = [];
     this.eventWaiter = undefined;
-    const timeoutMs = opts.timeoutMs ?? this.config.turnTimeoutMs;
     try {
-      const ok = await this.ensureStartedAbortable(opts.signal, timeoutMs);
+      const ok = await this.ensureStartedAbortable(opts.signal);
       if (!ok) {
         const result = this.snapshot("cancelled");
         this.finish(id);
         return { type: "answer", result };
       }
+      await this.selectModel(opts.model);
     } catch (err) {
       this.finish(id);
       throw err;
@@ -643,6 +849,20 @@ export class AcpSession {
         return { type: "answer", result: { text: "", stopReason: "cancelled", log: [], ms: 0 } };
       }
       if (event.kind === "permission") {
+        // If another ask is already queued behind the gate, parking here (the
+        // suspended turn holds the gate) would wedge it until this turn is
+        // permitted — which may never happen. Abandon instead, exactly like the
+        // sequential "new ask abandons a suspended turn" path: settle the request,
+        // snapshot, then reset() — which kills the child (so its late chunks can't
+        // bleed into the queued turn's output) and releases the gate so the queued
+        // ask takes over on a fresh session.
+        if (this.gateWaiters > 0) {
+          event.permission.cancel();
+          clearSegment();
+          const result = this.snapshot("cancelled");
+          this.reset();
+          return { type: "answer", result };
+        }
         // Suspend: keep the turn open; the wait for Claude's decision isn't timed.
         this.awaitingDecision = event.permission;
         clearSegment();
@@ -699,6 +919,9 @@ export class AcpSession {
    */
   reset(): void {
     this.turnId++; // invalidate the old turn's in-flight async work
+    // Settle a held-open permission request (best effort, before we kill the
+    // child) so the suspended turn's ACP promise isn't left dangling.
+    this.awaitingDecision?.cancel();
     this.forceReset();
     this.awaitingDecision = undefined;
     const waiter = this.eventWaiter;
@@ -709,14 +932,17 @@ export class AcpSession {
     this.releaseGate = undefined;
   }
 
-  /** Kill the subprocess and drop the session so the next turn respawns cleanly. */
+  /** Kill the subprocess and drop the session so the next turn respawns cleanly.
+   * SIGTERM first, then SIGKILL after a grace if the child ignores it — the README
+   * promises a real hard stop, and a wedged agent must not survive as an orphan. */
   private forceReset(): void {
     const child = this.child;
     this.child = undefined;
     this.conn = undefined;
     this.sessionId = undefined;
     this.starting = undefined;
-    child?.kill();
+    this.configOptions = [];
+    if (child) hardKill(child);
   }
 
   /** Current health, without starting a session. */
@@ -732,14 +958,19 @@ export class AcpSession {
         commands: this.config.allowCommands,
       },
       sessionStarted: this.sessionId !== undefined,
+      currentModel: this.modelInventory().currentModel,
       childAlive: child !== undefined && child.exitCode === null && !child.killed,
       pendingPermission: this.awaitingDecision?.description,
       stderrTail: this.stderr.join("").trim().slice(-600),
     };
   }
 
-  /** Terminate the member's ACP subprocess. */
+  /** Terminate the member's ACP subprocess immediately. Used for teardown —
+   * ephemeral `fresh` cleanup and process shutdown — where we want the child gone
+   * now, not gracefully: SIGKILL directly, since the deferred escalation in
+   * {@link hardKill} can't fire when the shutdown handler calls `process.exit`
+   * right after. (Mid-session cancels still use the graceful path via forceReset.) */
   dispose(): void {
-    this.child?.kill();
+    this.child?.kill("SIGKILL");
   }
 }

@@ -29,7 +29,7 @@ keeping one persistent session per member per workspace.
 
 | Tool | Use it to… |
 |------|-----------|
-| `consult` | convene the council on a question — each advisor gives an independent view, you synthesize. `rounds` > 1 makes them **deliberate** (hear and rebut each other); `until_settled` runs up to `rounds` and stops on consensus/stalemate |
+| `consult` | convene the council on a question — each advisor gives an independent view, you synthesize. **Deliberation is host-mediated**: it returns one round; weigh in (`my_take`) and **call again** to run the next round, iterating until you judge agreement. `members` picks who sits on the council (a subset); `fresh` runs each advisor on a throwaway session (no cross-call context) |
 
 **Ask one advisor directly** (a member's pair appears only when it isn't the host):
 
@@ -56,6 +56,7 @@ keeping one persistent session per member per workspace.
 | `permit` | allow/deny a permission a member raised mid-turn, then resume it (pass `member` if more than one is paused) |
 | `reset` | drop **all** members' accumulated context and start fresh sessions |
 | `status` | report the resolved host, the active council, and each active member's health |
+| `available_councilors` | start active members if needed and report ACP model selector values |
 
 All tools are **advisory** — the members answer, you decide. A member's direct
 tools (`ask_*`/`*_reply`) appear **only when that member isn't the host**; the
@@ -90,19 +91,73 @@ keep it to ~3 turns.
 ### The Magi council (`consult`)
 
 `consult` convenes your advisors — the council members other than you — on one
-question, and you synthesize. **Every active advisor weighs in.** By default it's a
-one-round **panel**: each gives an *independent* view (no cross-talk; Grok leans on
-its live web/X search where it helps), and you do the reconciling.
+question. **Every active advisor weighs in** with an *independent* view (no cross-talk;
+Grok leans on its live web/X search where it helps), and you synthesize.
 
-Pass **`rounds` > 1** to make them actually **deliberate**: round 1 is independent,
-then in each later round every advisor sees the others' prior answers and rebuts or
-refines, ending with a `VERDICT: CONSENSUS/OPEN` line. Add **`until_settled`** to
-treat `rounds` as a *max* and stop early once all advisors reach consensus, or once
-the debate **stalls** (verdicts stop changing) — the result is labelled *settled* /
-*stalemate* / *cap reached*.
+**Deliberation is host-mediated** (ADR 0016): `consult` runs **one round** and returns,
+telling you to form your own position and **call `consult` again** — with `my_take` set
+to your evolving position — to run the next round. The advisors keep their context
+(persistent sessions) and respond to *you*; you iterate until you judge agreement is
+reached, then act on it. So **you are a real participant**, not just the reader of an
+autonomous debate: cross-pollination flows through you (you integrate the voices and
+feed them back), round by round, for as long as it's worth it. There's no internal
+multi-round mode — the host drives the rounds.
 
-It runs members **sequentially** and **atomically** — a single tool call, no permit
-round-trips. A council turn is **read-only**: members may read any files and
+Pass **`members`** to choose who sits on the council for one call (default: every
+active advisor — the members other than you). Name a subset to convene just those (the
+host is never a member — it participates by driving the rounds, not by being spawned;
+ADR 0015).
+
+Pass **`fresh`** to run each advisor on a **throwaway session** — independent of any
+prior conversation and discarded when the consult ends — so the council's votes
+don't carry or leave cross-call context. It's slower (each advisor spawns fresh) and
+forfeits the accumulated "collaborator" memory, so it's opt-in; the default reuses
+the persistent sessions. (`fresh` is the lightweight end of the council-memory
+trade-off; the durable other end is the proposed `MAGI.md`, ADR 0011.)
+
+### Model selection
+
+Call **`available_councilors`** to see the ACP model selector values reported by
+the active members. Use the value at the start of each model row, not the display
+label. For example, Claude may report values like:
+
+```text
+default
+opus[1m]
+claude-fable-5[1m]
+sonnet
+haiku
+```
+
+Then pass **`models`** to choose per-member models for a council fan-out:
+
+```json
+{
+  "members": ["claude"],
+  "models": { "claude": "opus[1m]" },
+  "question": "Review this risky design decision."
+}
+```
+
+Single-advisor tools take **`model`** instead:
+
+```json
+{
+  "model": "sonnet",
+  "question": "Give me a quick second opinion."
+}
+```
+
+Model selection is ACP session-level. On persistent sessions it remains until
+changed or `reset`; with `fresh`, it applies only to that throwaway session. If a
+member does not report a model selector, or you pass an unavailable value, the tool
+returns a readable member-specific error instead of guessing a fallback. Use Opus
+for high-leverage reviews; keep Fable/Sonnet/Haiku for routine checks so the
+council does not silently eat the expensive budget.
+
+It runs members **concurrently** and **atomically** — every advisor's turn fans out
+at once (each on its own session), rendered back in member order, as a single tool
+call with no permit round-trips. A council turn is **read-only**: members may read any files and
 search/fetch to ground their answers, but writes and command execution are
 auto-denied (and surfaced as a `⚠️ blocked in council mode: …` line, so a
 grounded-looking answer can't hide a quietly-denied action). Grok's web/X search
@@ -166,8 +221,7 @@ instead of losing it. Pass a per-call `time` (seconds) to any tool to widen that
 idle window for a single big review/exploration. (The wait for a `permit`
 decision is **not** timed.) If your client caps tool calls more tightly, raise
 its timeout too — for Claude Code, `MCP_TOOL_TIMEOUT` (e.g. `600000`); `consult`
-runs every advisor back-to-back (and several rounds when deliberating), so it
-benefits most from a generous cap.
+runs every advisor concurrently in one round, so it benefits from a generous cap.
 The tool result stays focused on the member's answer plus a one-line footer
 (latency, tokens — Grok reports latency only); the full play-by-play goes to the
 debug log.
@@ -278,6 +332,39 @@ host's MCP server env:
 That host then gets Claude + Grok as its council (`ask_claude`, `ask_grok`,
 `consult`). Check `status` to confirm the resolved host and active council.
 
+For Codex CLI/IDE specifically, either add it with the CLI:
+
+```bash
+codex mcp add magi-council \
+  --env MAGI_COUNCIL_EXCLUDE=codex \
+  --env MAGI_COUNCIL_WORKSPACE=/ABS/PATH/your-project \
+  -- /ABS/PATH/TO/bun run /ABS/PATH/magi-council-mcp/src/index.ts
+```
+
+Or put this in `~/.codex/config.toml` (or a trusted project `.codex/config.toml`):
+
+```toml
+[mcp_servers.magi-council]
+command = "/ABS/PATH/TO/bun"
+args = ["run", "/ABS/PATH/magi-council-mcp/src/index.ts"]
+startup_timeout_sec = 20
+tool_timeout_sec = 600
+
+[mcp_servers.magi-council.env]
+MAGI_COUNCIL_EXCLUDE = "codex"
+MAGI_COUNCIL_WORKSPACE = "/ABS/PATH/your-project"
+```
+
+Then restart Codex or start a new session and run `/mcp` to confirm the server is
+connected. Use `command -v bun` to find the Bun path; an absolute command avoids
+startup failures when Codex's MCP launcher does not inherit your interactive shell
+`PATH`.
+
+`MAGI_COUNCIL_WORKSPACE` is optional: if omitted, the server scopes members to the
+MCP process cwd. For a project-specific config you can instead set
+`cwd = "/ABS/PATH/your-project"` on `[mcp_servers.magi-council]` and omit the
+workspace env var.
+
 ## Configuration (env)
 
 | Variable | Default | Meaning |
@@ -311,11 +398,27 @@ in [`src/permissions.ts`](src/permissions.ts).
 ```
 src/config.ts       env → Config + 3 per-member MemberSpecs + host-exclude override
 src/permissions.ts  guardianDecision — the pure permission policy
+src/council.ts      pure council-selection logic (selectCouncil)
 src/prompts.ts      host-parameterized prompts per tool (Codex/Grok/Claude, magi, generate)
-src/session.ts      AcpSession — ACP client: spawn a member, persistent session, streaming ask()
+src/session.ts      AcpSession — ACP client: spawn a member, model config, persistent session, streaming ask()
 src/reset.ts        per-workspace reset-nonce path (shared by server + hook)
 src/log.ts          per-turn debug log (stderr summary + optional JSONL file)
 src/index.ts        MCP server: 3 member sessions, host detection + tool gating, the Magi council
 hooks/session-reset.ts  SessionStart hook: reset members on the host's /clear (Claude Code)
+test/fake-acp.ts    a scripted ACP agent subprocess for tests (behavior by --scenario)
+test/*.test.ts      bun test: AcpSession lifecycle (E2E vs the fake) + pure council logic
 docs/adr/000*.md    design decisions
 ```
+
+## Tests
+
+```bash
+bun test       # deterministic, no network and no real model calls (a few seconds)
+bun run typecheck
+```
+
+`test/session.test.ts` drives `AcpSession` end-to-end against `test/fake-acp.ts` — a
+real ACP *agent* subprocess scripted by `--scenario` — through the genuine
+spawn → prompt → permission → cancel path, covering suspend/resume, reset, idle
+timeout, external cancel, crash-fails-fast, gate serialization, and nonce reset.
+`test/council.test.ts` unit-tests the pure council-selection logic in `src/council.ts`.

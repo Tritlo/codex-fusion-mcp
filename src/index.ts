@@ -5,23 +5,24 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { loadConfig, MEMBER_IDS, type MemberId, type MemberSpec } from "./config.ts";
+import { selectCouncil } from "./council.ts";
 import {
   AcpSession,
   NoPendingPermission,
   type AskOptions,
   type AskResult,
+  type ModelInventory,
   type SessionStatus,
   type TurnOutcome,
 } from "./session.ts";
 import {
   askClaudePrompt,
+  askCodexPrompt,
   askGrokPrompt,
   brainstormPrompt,
-  consultPrompt,
   explorePrompt,
   grokGeneratePrompt,
   magiAdvisorPrompt,
-  magiDeliberatePrompt,
   replyPrompt,
   reviewDiffPrompt,
   reviewPlanPrompt,
@@ -180,19 +181,28 @@ function inactiveResult(id: MemberId): ToolResult {
 /** Last line / tail of the streamed text so far, for a rolling live view. */
 const tail = (s: string): string => s.replace(/\s+/g, " ").trim().slice(-140);
 
-/** Streaming hooks that forward a member's output to the client as progress. */
-function streamHooks(extra: Extra, prefix = ""): Pick<AskOptions, "onText" | "onThought" | "onActivity"> {
+type Notify = (message: string) => void;
+
+/** A single monotonic progress channel for one MCP tool call. Concurrent council
+ * advisors must share *one* of these — MCP progress values are per-token and
+ * should increase, so a per-advisor counter would emit duplicate/out-of-order
+ * `progress` numbers on the same token. */
+function progressNotifier(extra: Extra): Notify {
   const token = extra._meta?.progressToken;
   let progress = 0;
-  let acc = "";
-  let thinking = "";
-  const notify = (message: string): void => {
+  return (message: string): void => {
     if (token === undefined) return;
     void extra.sendNotification({
       method: "notifications/progress",
       params: { progressToken: token, progress: ++progress, message },
     });
   };
+}
+
+/** Streaming hooks that forward a member's output via a (possibly shared) notifier. */
+function streamHooks(notify: Notify, prefix = ""): Pick<AskOptions, "onText" | "onThought" | "onActivity"> {
+  let acc = "";
+  let thinking = "";
   return {
     onText: (chunk) => {
       acc += chunk;
@@ -207,11 +217,11 @@ function streamHooks(extra: Extra, prefix = ""): Pick<AskOptions, "onText" | "on
 }
 
 /** Start a member turn, streaming progress, honouring cancellation, and reporting errors. */
-function ask(id: MemberId, prompt: string, extra: Extra, label: string, time?: number): Promise<ToolResult> {
+function ask(id: MemberId, prompt: string, extra: Extra, label: string, time?: number, model?: string): Promise<ToolResult> {
   const session = sessions[id];
   const timeoutMs = time !== undefined ? time * 1000 : undefined;
   return session
-    .ask(prompt, { label, signal: extra.signal, timeoutMs, ...streamHooks(extra) })
+    .ask(prompt, { label, signal: extra.signal, timeoutMs, model, ...streamHooks(progressNotifier(extra)) })
     .then((outcome) => renderOutcome(outcome, session.name))
     .catch((err: unknown) => renderMemberError(session.name, err, session.loginHint));
 }
@@ -233,7 +243,25 @@ const timeField = {
     ),
 };
 
-const server = new McpServer({ name: "magi-council", version: "0.1.0" });
+type ModelSelection = Partial<Record<MemberId, string>>;
+const modelValue = z.string().min(1);
+const modelField = {
+  model: modelValue
+    .optional()
+    .describe(
+      "Optional ACP model selector value/name to use for this member before the turn starts. The selection is session-level and remains until changed or reset.",
+    ),
+};
+const modelsField = {
+  models: z
+    .object({ claude: modelValue.optional(), codex: modelValue.optional(), grok: modelValue.optional() })
+    .optional()
+    .describe(
+      "Optional per-member ACP model selector values/names for a council fan-out, e.g. { codex: \"...\", claude: \"...\" }. Values come from available_councilors.",
+    ),
+};
+
+const server = new McpServer({ name: "magi-council", version: "0.2.0" });
 
 // Tool handles per member, so the host's direct tools can be removed once known.
 const memberTools: Record<MemberId, Array<{ remove(): void }>> = { claude: [], codex: [], grok: [] };
@@ -252,12 +280,13 @@ memberTools.codex.push(
           .string()
           .optional()
           .describe("Optional background: your current thinking, constraints, or relevant snippets."),
+        ...modelField,
         ...timeField,
       },
     },
-    ({ question, context, time }, extra) =>
+    ({ question, context, time, model }, extra) =>
       isActive("codex")
-        ? ask("codex", consultPrompt(hostName(), question, context), extra, "ask_codex", time)
+        ? ask("codex", askCodexPrompt(hostName(), question, context), extra, "ask_codex", time, model)
         : inactiveResult("codex"),
   ),
 );
@@ -270,12 +299,13 @@ memberTools.codex.push(
         "Continue the conversation with Codex on the SAME session (it remembers the thread). Push back on its last answer and drive toward consensus — keep the whole debate to ~3 turns.",
       inputSchema: {
         message: z.string().describe("Your rebuttal, counter-point, or follow-up question for Codex."),
+        ...modelField,
         ...timeField,
       },
     },
-    ({ message, time }, extra) =>
+    ({ message, time, model }, extra) =>
       isActive("codex")
-        ? ask("codex", replyPrompt(hostName(), message), extra, "codex_reply", time)
+        ? ask("codex", replyPrompt(hostName(), message), extra, "codex_reply", time, model)
         : inactiveResult("codex"),
   ),
 );
@@ -291,12 +321,13 @@ memberTools.claude.push(
       inputSchema: {
         question: z.string().describe("The specific question or decision to put to Claude."),
         context: z.string().optional().describe("Optional background, constraints, or relevant snippets."),
+        ...modelField,
         ...timeField,
       },
     },
-    ({ question, context, time }, extra) =>
+    ({ question, context, time, model }, extra) =>
       isActive("claude")
-        ? ask("claude", askClaudePrompt(hostName(), question, context), extra, "ask_claude", time)
+        ? ask("claude", askClaudePrompt(hostName(), question, context), extra, "ask_claude", time, model)
         : inactiveResult("claude"),
   ),
 );
@@ -309,12 +340,13 @@ memberTools.claude.push(
         "Continue the conversation with Claude on the SAME session (it remembers the thread). Use to push back on or follow up Claude's last answer.",
       inputSchema: {
         message: z.string().describe("Your rebuttal, counter-point, or follow-up question for Claude."),
+        ...modelField,
         ...timeField,
       },
     },
-    ({ message, time }, extra) =>
+    ({ message, time, model }, extra) =>
       isActive("claude")
-        ? ask("claude", replyPrompt(hostName(), message), extra, "claude_reply", time)
+        ? ask("claude", replyPrompt(hostName(), message), extra, "claude_reply", time, model)
         : inactiveResult("claude"),
   ),
 );
@@ -330,12 +362,13 @@ memberTools.grok.push(
       inputSchema: {
         question: z.string().describe("The specific question or task to put to Grok."),
         context: z.string().optional().describe("Optional background, constraints, or relevant snippets."),
+        ...modelField,
         ...timeField,
       },
     },
-    ({ question, context, time }, extra) =>
+    ({ question, context, time, model }, extra) =>
       isActive("grok")
-        ? ask("grok", askGrokPrompt(hostName(), question, context), extra, "ask_grok", time)
+        ? ask("grok", askGrokPrompt(hostName(), question, context), extra, "ask_grok", time, model)
         : inactiveResult("grok"),
   ),
 );
@@ -348,11 +381,14 @@ memberTools.grok.push(
         "Continue the conversation with Grok on the SAME session (it remembers the thread). Use to push back on or follow up Grok's last answer.",
       inputSchema: {
         message: z.string().describe("Your rebuttal, counter-point, or follow-up question for Grok."),
+        ...modelField,
         ...timeField,
       },
     },
-    ({ message, time }, extra) =>
-      isActive("grok") ? ask("grok", replyPrompt(hostName(), message), extra, "grok_reply", time) : inactiveResult("grok"),
+    ({ message, time, model }, extra) =>
+      isActive("grok")
+        ? ask("grok", replyPrompt(hostName(), message), extra, "grok_reply", time, model)
+        : inactiveResult("grok"),
   ),
 );
 
@@ -372,12 +408,13 @@ memberTools.grok.push(
           .string()
           .optional()
           .describe("Optional path/filename to save to (relative to the workspace). Omit to let Grok choose."),
+        ...modelField,
         ...timeField,
       },
     },
-    ({ prompt, kind, output_path, time }, extra) =>
+    ({ prompt, kind, output_path, time, model }, extra) =>
       isActive("grok")
-        ? ask("grok", grokGeneratePrompt(prompt, kind ?? "image", output_path), extra, "grok_generate", time)
+        ? ask("grok", grokGeneratePrompt(prompt, kind ?? "image", output_path), extra, "grok_generate", time, model)
         : inactiveResult("grok"),
   ),
 );
@@ -405,15 +442,18 @@ server.registerTool(
       plan: z.string().describe("The plan/approach to review (steps, design, or intended changes)."),
       context: z.string().optional().describe("Optional background or constraints."),
       ...memberField,
+      ...modelField,
+      ...modelsField,
       ...timeField,
     },
   },
-  ({ plan, context, member, time }, extra) => {
+  ({ plan, context, member, time, model, models }, extra) => {
     const build = (id: MemberId): string => reviewPlanPrompt(specs[id].promptName, hostName(), plan, context);
-    if (member === "council") return councilFanOut("review_plan", build, extra, time !== undefined ? time * 1000 : undefined);
+    if (member === "council")
+      return councilFanOut("review_plan", build, extra, time !== undefined ? time * 1000 : undefined, persistentSession, activeIds(), undefined, models);
     const target = advisorFor(member);
     if (!target) return inactiveResult(member!);
-    return ask(target, build(target), extra, "review_plan", time);
+    return ask(target, build(target), extra, "review_plan", time, model);
   },
 );
 
@@ -427,15 +467,32 @@ server.registerTool(
       paths: z.string().optional().describe("Paths to focus on (used when no diff is supplied)."),
       instructions: z.string().optional().describe("Optional extra focus for the review."),
       ...memberField,
+      ...modelField,
+      ...modelsField,
       ...timeField,
     },
   },
-  ({ diff, paths, instructions, member, time }, extra) => {
+  ({ diff, paths, instructions, member, time, model, models }, extra) => {
     const build = (id: MemberId): string => reviewDiffPrompt(specs[id].promptName, hostName(), { diff, paths, instructions });
-    if (member === "council") return councilFanOut("review_diff", build, extra, time !== undefined ? time * 1000 : undefined);
+    if (member === "council") {
+      // Council mode is read-only — it can't run `git diff`. Without an explicit
+      // diff the advisors would have nothing to review, so refuse early rather
+      // than fan out to a guaranteed "I couldn't inspect the changes".
+      if (!diff || diff.trim().length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: 'review_diff with `member: "council"` needs an explicit `diff`: council mode is read-only and can\'t run `git diff`. Pass a diff, or use single-advisor review_diff (default Codex), which can run `git diff` via a permit.',
+            },
+          ],
+        };
+      }
+      return councilFanOut("review_diff", build, extra, time !== undefined ? time * 1000 : undefined, persistentSession, activeIds(), undefined, models);
+    }
     const target = advisorFor(member);
     if (!target) return inactiveResult(member!);
-    return ask(target, build(target), extra, "review_diff", time);
+    return ask(target, build(target), extra, "review_diff", time, model);
   },
 );
 
@@ -448,15 +505,18 @@ server.registerTool(
       problem: z.string().describe("The design problem to explore."),
       constraints: z.string().optional().describe("Optional constraints, requirements, or non-goals."),
       ...memberField,
+      ...modelField,
+      ...modelsField,
       ...timeField,
     },
   },
-  ({ problem, constraints, member, time }, extra) => {
+  ({ problem, constraints, member, time, model, models }, extra) => {
     const build = (id: MemberId): string => brainstormPrompt(specs[id].promptName, hostName(), problem, constraints);
-    if (member === "council") return councilFanOut("brainstorm", build, extra, time !== undefined ? time * 1000 : undefined);
+    if (member === "council")
+      return councilFanOut("brainstorm", build, extra, time !== undefined ? time * 1000 : undefined, persistentSession, activeIds(), undefined, models);
     const target = advisorFor(member);
     if (!target) return inactiveResult(member!);
-    return ask(target, build(target), extra, "brainstorm", time);
+    return ask(target, build(target), extra, "brainstorm", time, model);
   },
 );
 
@@ -469,15 +529,18 @@ server.registerTool(
       focus: z.string().optional().describe("What to focus the exploration on (a feature, subsystem, or question)."),
       paths: z.string().optional().describe("Optional starting paths."),
       ...memberField,
+      ...modelField,
+      ...modelsField,
       ...timeField,
     },
   },
-  ({ focus, paths, member, time }, extra) => {
+  ({ focus, paths, member, time, model, models }, extra) => {
     const build = (id: MemberId): string => explorePrompt(specs[id].promptName, hostName(), focus, paths);
-    if (member === "council") return councilFanOut("explore", build, extra, time !== undefined ? time * 1000 : undefined);
+    if (member === "council")
+      return councilFanOut("explore", build, extra, time !== undefined ? time * 1000 : undefined, persistentSession, activeIds(), undefined, models);
     const target = advisorFor(member);
     if (!target) return inactiveResult(member!);
-    return ask(target, build(target), extra, "explore", time);
+    return ask(target, build(target), extra, "explore", time, model);
   },
 );
 
@@ -487,29 +550,29 @@ server.registerTool(
   "consult",
   {
     description:
-      "Consult the Magi council — every active advisor (the council members other than you) gives an independent view, and you synthesize. With `rounds` > 1 the advisors deliberate: round 1 is independent, then each sees the others' answers and rebuts/refines (each ends with a CONSENSUS/OPEN verdict). With `until_settled`, `rounds` is the max and it stops early once all advisors reach consensus or the debate stalls. For one specific advisor use `ask_codex`/`ask_grok`/`ask_claude`; for a structured single-advisor pass use `review_plan`/`review_diff`/`brainstorm`/`explore` (those take `member: \"council\"` to fan out one round to all).",
+      "Consult the Magi council — every active advisor (the council members other than you) gives an independent view in one round, and you synthesize. Deliberation is host-mediated: it returns after one round; to make the council deliberate, weigh in and **call `consult` again** with `my_take` set to your evolving position (the advisors keep their context and respond to you), iterating until you judge agreement is reached. For one specific advisor use `ask_codex`/`ask_grok`/`ask_claude`; for a structured single-advisor pass use `review_plan`/`review_diff`/`brainstorm`/`explore` (those take `member: \"council\"` to fan out to all).",
     inputSchema: {
       question: z.string().describe("The question or decision to put to the council."),
       context: z.string().optional().describe("Optional background or constraints."),
       my_take: z
         .string()
         .optional()
-        .describe("Your own current position, put before the council so the advisors can engage it directly."),
-      rounds: z
-        .number()
-        .int()
-        .min(1)
-        .max(8)
-        .optional()
         .describe(
-          "Number of deliberation rounds (default 1 = independent panel, no cross-talk). 2+ makes the advisors hear and respond to each other. With `until_settled`, this is the max.",
+          "Your own current position, put before the council so the advisors engage it directly. Update this and call again to run the next round of the deliberation.",
         ),
-      until_settled: z
+      fresh: z
         .boolean()
         .optional()
         .describe(
-          "Treat `rounds` as a cap and stop early once all advisors reach CONSENSUS, or the debate stalls (verdicts stop changing). Default false.",
+          "Run each advisor on a throwaway session — independent of any prior conversation and discarded afterward — so the council's votes don't carry or leave cross-call context. Slower (each advisor spawns fresh). Default false (reuse the persistent collaborator sessions). Note: `fresh` makes each call independent, so it doesn't accumulate the host-mediated deliberation across calls.",
         ),
+      members: z
+        .array(z.enum(["claude", "codex", "grok"]))
+        .optional()
+        .describe(
+          "Which members sit on the council for this call. Omit for the default — every active advisor (the members other than you). Name a subset to convene just those. (The host is never a member; it participates by driving the rounds.)",
+        ),
+      ...modelsField,
       ...timeField,
     },
   },
@@ -520,8 +583,9 @@ interface MagiArgs {
   question: string;
   context?: string;
   my_take?: string;
-  rounds?: number;
-  until_settled?: boolean;
+  fresh?: boolean;
+  members?: MemberId[];
+  models?: ModelSelection;
   time?: number;
 }
 
@@ -537,87 +601,125 @@ function renderVoice(name: string, result: AskResult | null): string {
   return lines.join("\n");
 }
 
+/** Resolves the session a council turn runs on — the persistent one, or an
+ * ephemeral one for a `fresh` consult. */
+type SessionFor = (id: MemberId) => AcpSession;
+const persistentSession: SessionFor = (id) => sessions[id];
+
 /**
- * Fan a task out to every active advisor, in member order, and render their
- * voices for the host to synthesize. `buildPrompt(id)` produces each advisor's
- * prompt. Sequential and atomic — each turn auto-denies guardian "ask" so the
- * whole council is one tool call. Each member is caught independently so one
- * failure still returns the others. (Advisors answer independently; they do not
- * see each other's replies.)
+ * Run one advisor's council turn (read-only, atomic — guardian "ask" auto-denies,
+ * so it never suspends), returning both its rendered voice and its raw answer text
+ * (for the settlement check). Member errors are caught and rendered, so one failing
+ * advisor never sinks the others.
+ */
+async function councilTurn(
+  id: MemberId,
+  prompt: string,
+  label: string,
+  prefix: string,
+  extra: Extra,
+  notify: Notify,
+  timeoutMs: number | undefined,
+  model: string | undefined,
+  getSession: SessionFor,
+): Promise<{ name: string; markup: string; text: string }> {
+  const name = specs[id].name;
+  try {
+    const outcome = await getSession(id).ask(prompt, {
+      label,
+      signal: extra.signal,
+      timeoutMs,
+      model,
+      onAskPermission: "read-only",
+      ...streamHooks(notify, prefix),
+    });
+    const result = outcome.type === "answer" ? outcome.result : null;
+    return { name, markup: renderVoice(name, result), text: result?.text ?? "" };
+  } catch (err) {
+    return {
+      name,
+      markup: `### ${name}\n\n${renderMemberError(name, err, specs[id].loginHint).content[0]!.text}`,
+      text: "",
+    };
+  }
+}
+
+/** Prepended when the host is unrecognized (one voice may be the host itself). */
+function unknownHostWarning(): string | undefined {
+  const r = resolveHost();
+  return r.source === "unknown"
+    ? `⚠️ Host not recognized (clientInfo: ${r.rawClient ?? "none"}); all three members are participating, so one of these voices may be you. Set \`MAGI_COUNCIL_EXCLUDE=claude|codex|grok\` to exclude yourself.`
+    : undefined;
+}
+
+/**
+ * Fan a task out to every active advisor and render their voices for the host to
+ * synthesize. `buildPrompt(id)` produces each advisor's prompt. Advisors run
+ * **concurrently** (each on its own session/gate) and are rendered in member
+ * order; the whole council is still one atomic tool call. Each member is caught
+ * independently so one failure still returns the others. (Advisors answer
+ * independently; they do not see each other's replies.)
  */
 async function councilFanOut(
   label: string,
   buildPrompt: (id: MemberId) => string,
   extra: Extra,
   timeoutMs: number | undefined,
+  getSession: SessionFor = persistentSession,
+  ids: MemberId[] = activeIds(),
+  synth?: string,
+  models?: ModelSelection,
 ): Promise<ToolResult> {
   const host = hostName();
-  const r = resolveHost();
   const sections: string[] = [];
+  const warning = unknownHostWarning();
+  if (warning) sections.push(warning);
 
-  if (r.source === "unknown") {
-    sections.push(
-      `⚠️ Host not recognized (clientInfo: ${r.rawClient ?? "none"}); all three members are participating, so one of these voices may be you. Set \`MAGI_COUNCIL_EXCLUDE=claude|codex|grok\` to exclude yourself.`,
-    );
-  }
+  const notify = progressNotifier(extra); // one shared channel for all concurrent advisors
+  const voices = await Promise.all(
+    ids.map((id) =>
+      councilTurn(id, buildPrompt(id), label, `${specs[id].name} `, extra, notify, timeoutMs, models?.[id], getSession),
+    ),
+  );
+  sections.push(...voices.map((v) => v.markup));
 
-  for (const id of activeIds()) {
-    try {
-      const outcome = await sessions[id].ask(buildPrompt(id), {
-        label,
-        signal: extra.signal,
-        timeoutMs,
-        onAskPermission: "read-only",
-        ...streamHooks(extra, `${specs[id].name} `),
-      });
-      const result = outcome.type === "answer" ? outcome.result : null;
-      sections.push(renderVoice(specs[id].name, result));
-    } catch (err) {
-      sections.push(`### ${specs[id].name}\n\n${renderMemberError(specs[id].name, err, specs[id].loginHint).content[0]!.text}`);
-    }
-  }
-
-  const synth = `_You (${host}) are the lead — weigh these voices and decide. Follow up with the active members' reply tools (\`codex_reply\` / \`grok_reply\` / \`claude_reply\`), or ask one directly (\`ask_codex\` / \`ask_grok\` / \`ask_claude\`)._`;
-  return { content: [{ type: "text", text: [...sections, synth].join("\n\n---\n\n") }] };
-}
-
-/** Classify an advisor's VERDICT line, if present. */
-function verdictKind(text: string): "consensus" | "open" | null {
-  const m = text.match(/^[\s>*_-]*\**\s*VERDICT:\s*\**\s*(CONSENSUS|OPEN)\b/im);
-  return m ? (m[1]!.toUpperCase() === "CONSENSUS" ? "consensus" : "open") : null;
-}
-
-/** Normalized VERDICT line, for detecting a debate whose positions stopped moving. */
-function verdictSignature(text: string): string {
-  const m = text.match(/^.*VERDICT:.*$/im);
-  return (m ? m[0] : text.slice(-120)).replace(/[\s*_>-]+/g, " ").trim().toLowerCase();
-}
-
-/** True if two non-empty signature lists are the same multiset. */
-function sameMultiset(a: string[], b: string[]): boolean {
-  if (a.length === 0 || a.length !== b.length) return false;
-  const sa = [...a].sort();
-  const sb = [...b].sort();
-  return sa.every((v, i) => v === sb[i]);
+  const footer =
+    synth ??
+    `_You (${host}) are the lead — weigh these voices and decide. Follow up with the active members' reply tools (\`codex_reply\` / \`grok_reply\` / \`claude_reply\`), or ask one directly (\`ask_codex\` / \`ask_grok\` / \`ask_claude\`)._`;
+  return { content: [{ type: "text", text: [...sections, footer].join("\n\n---\n\n") }] };
 }
 
 /**
- * Run the Magi council. `rounds` = 1 (default) is an independent panel (no
- * cross-talk). `rounds` > 1 deliberates: round 1 independent, then each advisor
- * sees the others' prior answers and responds with a CONSENSUS/OPEN verdict. With
- * `until_settled`, `rounds` is the cap and the loop stops early once all advisors
- * reach consensus or the debate stalls (verdicts stop changing).
+ * Run one round of the Magi council: every selected advisor answers the question
+ * independently (concurrently), and the result tells the host to weigh in and call
+ * again to deliberate. The host *is* the deliberation loop — there is no autonomous
+ * multi-round mode; the host drives the rounds by re-calling with an updated
+ * `my_take`. With `fresh`, each advisor runs on a throwaway session (so a call
+ * doesn't carry or leave cross-call context — and so doesn't accumulate the loop).
  */
 async function runMagi(args: MagiArgs, extra: Extra): Promise<ToolResult> {
   const { question, context, my_take, time } = args;
-  const maxRounds = Math.max(1, Math.min(args.rounds ?? 1, 8));
-  const untilSettled = args.until_settled ?? false;
+  const fresh = args.fresh ?? false;
   const timeoutMs = time !== undefined ? time * 1000 : undefined;
   const host = hostName();
 
-  // Single-round panel — the common case, today's behavior.
-  if (maxRounds === 1) {
-    return councilFanOut(
+  // Who's on the council this call: the default active advisors, or an explicit
+  // subset of them. The host is never a member — it participates by *driving* the
+  // rounds (see the closing instruction), not by being spawned.
+  const active = selectCouncil(args.members, activeIds());
+  if (active.length === 0) {
+    return { content: [{ type: "text", text: "No active council members in your selection." }] };
+  }
+
+  // For `fresh`, give each advisor a one-shot session, disposed when this call
+  // ends — never the persistent one.
+  const ephemeral: Partial<Record<MemberId, AcpSession>> = {};
+  const getSession: SessionFor = fresh
+    ? (id) => (ephemeral[id] ??= new AcpSession(config, specs[id]))
+    : persistentSession;
+
+  try {
+    return await councilFanOut(
       "consult",
       (id) =>
         magiAdvisorPrompt({
@@ -626,93 +728,79 @@ async function runMagi(args: MagiArgs, extra: Extra): Promise<ToolResult> {
           question,
           context,
           hostTake: my_take,
-          fellowAdvisors: activeIds().filter((x) => x !== id).map((x) => specs[x].name),
+          fellowAdvisors: active.filter((x) => x !== id).map((x) => specs[x].name),
           grokStrengths: id === "grok",
         }),
       extra,
       timeoutMs,
+      getSession,
+      active,
+      `_You (${host}) are the lead **and a participant** in this deliberation. Read these views and form your own position. **Unless you and the council have reached agreement, call \`consult\` again** with \`my_take\` set to your current position (and any new framing in \`context\`) to run the next round — the advisors keep their context and will respond to you. Iterate until you judge agreement is reached, then act on it. (Or ask one directly with \`ask_codex\`/\`ask_grok\`/\`ask_claude\`.)_`,
+      args.models,
     );
+  } finally {
+    for (const s of Object.values(ephemeral)) s?.dispose();
   }
-
-  const active = activeIds();
-  const blocks: string[] = [];
-  if (resolveHost().source === "unknown") {
-    blocks.push(
-      `⚠️ Host not recognized; all three members are participating, so one voice may be you. Set \`MAGI_COUNCIL_EXCLUDE=claude|codex|grok\` to exclude yourself.`,
-    );
-  }
-
-  let prev: Array<{ name: string; text: string }> = [];
-  let prevSig: string[] = [];
-  let outcome = "";
-
-  for (let round = 1; round <= maxRounds; round++) {
-    const cur: Array<{ name: string; text: string }> = [];
-    const voices: string[] = [];
-    for (const id of active) {
-      const prompt =
-        round === 1
-          ? magiAdvisorPrompt({
-              advisor: specs[id].promptName,
-              host,
-              question,
-              context,
-              hostTake: my_take,
-              fellowAdvisors: active.filter((x) => x !== id).map((x) => specs[x].name),
-              grokStrengths: id === "grok",
-            })
-          : magiDeliberatePrompt({
-              advisor: specs[id].promptName,
-              host,
-              question,
-              context,
-              hostTake: my_take,
-              priorPositions: prev,
-              round,
-              maxRounds,
-              grokStrengths: id === "grok",
-            });
-      try {
-        const o = await sessions[id].ask(prompt, {
-          label: "consult",
-          signal: extra.signal,
-          timeoutMs,
-          onAskPermission: "read-only",
-          ...streamHooks(extra, `${specs[id].name} R${round} `),
-        });
-        const result = o.type === "answer" ? o.result : null;
-        cur.push({ name: specs[id].name, text: result?.text ?? "" });
-        voices.push(renderVoice(specs[id].name, result));
-      } catch (err) {
-        cur.push({ name: specs[id].name, text: "" });
-        voices.push(`### ${specs[id].name}\n\n${renderMemberError(specs[id].name, err, specs[id].loginHint).content[0]!.text}`);
-      }
-    }
-    blocks.push(`## Round ${round}${round === 1 ? " — independent openings" : ""}\n\n${voices.join("\n\n---\n\n")}`);
-
-    const sig = cur.map((c) => verdictSignature(c.text));
-    if (untilSettled && round >= 2) {
-      if (cur.every((c) => verdictKind(c.text) === "consensus")) {
-        outcome = `✅ **Settled** — all advisors reached consensus after ${round} rounds.`;
-        break;
-      }
-      if (sameMultiset(sig, prevSig)) {
-        outcome = `⚖️ **Stalemate** — positions stopped changing after ${round} rounds.`;
-        break;
-      }
-    }
-    prevSig = sig;
-    prev = cur;
-    if (round === maxRounds) {
-      outcome = untilSettled ? `⏹️ Reached the ${maxRounds}-round cap without consensus.` : `Completed ${maxRounds} rounds.`;
-    }
-  }
-
-  const synth = `${outcome ? `${outcome}\n\n` : ""}_You (${host}) are the lead — weigh the debate and decide. Continue with the reply tools or another \`consult\`._`;
-  return { content: [{ type: "text", text: [...blocks, synth].join("\n\n---\n\n") }] };
 }
 
 // --- Shared session controls ----------------------------------------------
+
+function renderModelInventory(id: MemberId, inventory: ModelInventory): string {
+  const lines = [`${specs[id].name}:`];
+  lines.push(`  session: ${inventory.sessionStarted ? "started" : "not started"}`);
+  lines.push(`  selector: ${inventory.selector ? `${inventory.selector.name} (${inventory.selector.id})` : "not reported"}`);
+  lines.push(`  current model: ${inventory.currentModel ?? "not reported"}`);
+  if (inventory.models.length === 0) {
+    lines.push("  models: not reported by ACP");
+  } else {
+    lines.push("  models:");
+    for (const model of inventory.models) {
+      const label = model.name === model.value ? model.value : `${model.value} (${model.name})`;
+      const group = model.group ? ` [${model.group}]` : "";
+      const current = model.current ? " (current)" : "";
+      lines.push(`    ${label}${group}${current}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+server.registerTool(
+  "available_councilors",
+  {
+    description:
+      "Start the requested active council members if needed and report the ACP model selector values they expose. Does not send a prompt/model turn; use the listed values with `consult.models` or single-member `model`.",
+    inputSchema: {
+      members: z
+        .array(z.enum(["claude", "codex", "grok"]))
+        .optional()
+        .describe("Optional active members to inspect. Omit for every active council member."),
+    },
+  },
+  async ({ members }, extra) => {
+    const ids = selectCouncil(members, activeIds());
+    if (ids.length === 0) {
+      return { content: [{ type: "text" as const, text: "No active council members in your selection." }] };
+    }
+    const sections = await Promise.all(
+      ids.map(async (id) => {
+        try {
+          return renderModelInventory(id, await sessions[id].availableModels(extra.signal));
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return `${specs[id].name}:\n  unavailable: ${msg}`;
+        }
+      }),
+    );
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `${sections.join("\n\n")}\n\nUse the value at the start of a model row, not the display name, when possible.`,
+        },
+      ],
+    };
+  },
+);
 
 server.registerTool(
   "permit",
@@ -761,7 +849,7 @@ server.registerTool(
           label: "permit",
           signal: extra.signal,
           timeoutMs: time !== undefined ? time * 1000 : undefined,
-          ...streamHooks(extra),
+          ...streamHooks(progressNotifier(extra)),
         },
         note,
       )
@@ -833,6 +921,7 @@ function renderStatus(s: SessionStatus): string {
     `  acp command: ${s.acpCommand}`,
     `  guardian: external-reads ${onoff(s.guardian.externalReads)} · writes ${onoff(s.guardian.writes)} · commands ${onoff(s.guardian.commands)}`,
     `  session: ${s.sessionStarted ? "started" : "not started"} · subprocess: ${s.childAlive ? "alive" : "down"}`,
+    `  model: ${s.currentModel ?? "not reported"}`,
     `  ${s.pendingPermission ? `awaiting permit: ${s.pendingPermission}` : "no pending permission"}`,
     s.stderrTail ? `  recent stderr:\n${s.stderrTail}` : "  no stderr captured",
   ].join("\n");

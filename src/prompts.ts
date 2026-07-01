@@ -51,8 +51,9 @@ const DELIBERATION_ONLY = `<deliberation_only>
 This is a READ-ONLY council deliberation. You MAY read any files and search/fetch to ground your view — read whatever you need directly (don't shell out for it). You may NOT modify files or run shell commands: writes and command execution are auto-declined here. Built-in web/X search is fine and encouraged where it helps. If something genuinely can't be inspected, say so briefly rather than trying to run a command.
 </deliberation_only>`;
 
-/** A focused question / second opinion on a specific decision. */
-export function consultPrompt(host: string, question: string, context?: string): string {
+/** A focused question / second opinion on a specific decision, from Codex (the
+ * `ask_codex` endpoint). Named for the member, not the `consult` council tool. */
+export function askCodexPrompt(host: string, question: string, context?: string): string {
   return assemble(
     CODEX,
     host,
@@ -213,43 +214,6 @@ export function magiAdvisorPrompt(opts: {
     opts.grokStrengths ? GROK_STRENGTHS_COUNCIL : "",
     DELIBERATION_ONLY,
     `<compact_output_contract>\nYour position in ≤4 sentences, then up to ~4 bullets of key reasoning, risks, or where you'd push back on the host. No preamble.\n</compact_output_contract>`,
-    GROUNDING,
-  );
-}
-
-/**
- * A later deliberation round: the advisor sees every advisor's previous-round
- * position and responds — engaging the others, updating where warranted, and
- * ending with a CONSENSUS/OPEN verdict the council loop uses to detect when the
- * debate has settled or stalled.
- */
-export function magiDeliberatePrompt(opts: {
-  advisor: string;
-  host: string;
-  question: string;
-  context?: string;
-  hostTake?: string;
-  priorPositions: Array<{ name: string; text: string }>;
-  round: number;
-  maxRounds: number;
-  grokStrengths?: boolean;
-}): string {
-  const positions = opts.priorPositions
-    .map((p) => `### ${p.name}\n${p.text.trim() || "(no usable answer)"}`)
-    .join("\n\n");
-  const fellows = opts.priorPositions.map((p) => p.name).filter((n) => n !== opts.advisor);
-  return assemble(
-    opts.advisor,
-    opts.host,
-    magiFrame(opts.host, fellows),
-    `<deliberation_round>\nThis is round ${opts.round} of up to ${opts.maxRounds}. Below are every advisor's positions from the previous round (including your own). Engage the others directly: say where you agree, where you disagree and why, and update your own view if they've changed your mind. Converge if you honestly can; hold your ground with reasons if you can't.\n</deliberation_round>`,
-    `<question>\n${opts.question.trim()}\n</question>`,
-    withContext(opts.context),
-    opts.hostTake && opts.hostTake.trim().length > 0 ? `<host_position>\n${opts.hostTake.trim()}\n</host_position>` : "",
-    `<previous_round>\n${positions}\n</previous_round>`,
-    opts.grokStrengths ? GROK_STRENGTHS_COUNCIL : "",
-    DELIBERATION_ONLY,
-    `<output_contract>\nRespond in ≤4 sentences, then up to ~4 bullets engaging the other advisors. Then end with EXACTLY one final line, one of:\nVERDICT: CONSENSUS — <the one-sentence conclusion you now share with the council>\nVERDICT: OPEN — <the single most important point still unresolved>\n</output_contract>`,
     GROUNDING,
   );
 }
