@@ -9,6 +9,7 @@ import {
   type Client,
   type PermissionOption,
   type RequestPermissionResponse,
+  type SessionConfigOption,
   type SessionNotification,
   type Usage,
 } from "@agentclientprotocol/sdk";
@@ -113,6 +114,8 @@ export interface AskOptions {
   onActivity?: (note: string) => void;
   /** Override the idle timeout (ms) for this turn; falls back to the config default. */
   timeoutMs?: number;
+  /** Optional ACP model selector value/name to use before sending this turn. */
+  model?: string;
   /**
    * How to handle a guardian "ask" verdict for this turn. `"suspend"` (the
    * default) hands the decision back to Claude as a permission and pauses the
@@ -160,10 +163,30 @@ export interface SessionStatus {
   acpCommand: string;
   guardian: { externalReads: boolean; writes: boolean; commands: boolean };
   sessionStarted: boolean;
+  /** Current ACP model selector value, when the member reports one. */
+  currentModel?: string;
   childAlive: boolean;
   /** Description of a permission currently awaiting Claude's decision, if any. */
   pendingPermission?: string;
   stderrTail: string;
+}
+
+/** One model choice reported by a member's ACP session config. */
+export interface ModelChoice {
+  value: string;
+  name: string;
+  description?: string;
+  group?: string;
+  current: boolean;
+}
+
+/** Model selector inventory for one council member. */
+export interface ModelInventory {
+  name: string;
+  sessionStarted: boolean;
+  selector?: { id: string; name: string };
+  currentModel?: string;
+  models: ModelChoice[];
 }
 
 /**
@@ -184,6 +207,7 @@ export class AcpSession {
   private conn?: ClientSideConnection;
   private sessionId?: string;
   private starting?: Promise<void>;
+  private configOptions: SessionConfigOption[] = [];
   private readonly stderr: string[] = [];
 
   // In-flight turn state (safe because turns are serialized behind the gate).
@@ -240,6 +264,86 @@ export class AcpSession {
   /** True if a turn is suspended awaiting Claude's permit decision. */
   isAwaitingPermission(): boolean {
     return this.awaitingDecision !== undefined;
+  }
+
+  private modelOption(): SessionConfigOption | undefined {
+    const modelOptions = this.configOptions.filter((o) => o.type === "select" && o.category === "model");
+    return (
+      modelOptions[0] ??
+      this.configOptions.find(
+        (o) => o.type === "select" && `${o.id} ${o.name} ${o.category ?? ""}`.toLowerCase().includes("model"),
+      )
+    );
+  }
+
+  private modelChoices(option: SessionConfigOption): ModelChoice[] {
+    if (option.type !== "select") return [];
+    return option.options.flatMap((entry) => {
+      if ("group" in entry) {
+        return entry.options.map((o) => ({
+          value: o.value,
+          name: o.name,
+          description: o.description ?? undefined,
+          group: entry.name,
+          current: o.value === option.currentValue,
+        }));
+      }
+      return [
+        {
+          value: entry.value,
+          name: entry.name,
+          description: entry.description ?? undefined,
+          current: entry.value === option.currentValue,
+        },
+      ];
+    });
+  }
+
+  private modelInventory(): ModelInventory {
+    const option = this.modelOption();
+    const choices = option ? this.modelChoices(option) : [];
+    const current = choices.find((c) => c.current);
+    return {
+      name: this.member.name,
+      sessionStarted: this.sessionId !== undefined,
+      selector: option ? { id: option.id, name: option.name } : undefined,
+      currentModel: current?.value ?? (option?.type === "select" ? option.currentValue : undefined),
+      models: choices,
+    };
+  }
+
+  private async selectModel(model: string | undefined): Promise<void> {
+    const requested = model?.trim();
+    if (!requested) return;
+    const option = this.modelOption();
+    if (!option) throw new Error(`${this.member.name} does not report an ACP model selector`);
+    const choices = this.modelChoices(option);
+    const requestedLower = requested.toLowerCase();
+    const choice =
+      choices.find((c) => c.value === requested || c.name === requested) ??
+      choices.find((c) => c.value.toLowerCase() === requestedLower || c.name.toLowerCase() === requestedLower);
+    if (!choice) {
+      const available = choices.length > 0 ? choices.map((c) => c.value).join(", ") : "(none reported)";
+      throw new Error(`${this.member.name} does not report model ${requested}. Available models: ${available}`);
+    }
+    if (choice.value === option.currentValue) return;
+    if (!this.conn || !this.sessionId) throw new Error(`${this.member.name} session is not started`);
+    this.turnLog.push(`model selected: ${choice.value}`);
+    this.turnOnActivity?.(`model: ${choice.value}`);
+    const updated = await this.conn.setSessionConfigOption({
+      sessionId: this.sessionId,
+      configId: option.id,
+      value: choice.value,
+    });
+    this.configOptions = updated.configOptions ?? [];
+  }
+
+  /** Start the member if needed and return its ACP-reported model selector. */
+  async availableModels(signal?: AbortSignal): Promise<ModelInventory> {
+    this.checkSessionEpoch();
+    const ok = await this.ensureStartedAbortable(signal);
+    if (!ok) throw new Error(`${this.member.name} startup cancelled`);
+    return this.modelInventory();
   }
 
   private pickOption(options: PermissionOption[], allow: boolean): PermissionOption | undefined {
@@ -384,6 +488,9 @@ export class AcpSession {
             // into turnText, which must stay the member's final answer.
             if (u.content.type === "text") this.turnOnThought?.(u.content.text);
             break;
+          case "config_option_update":
+            this.configOptions = u.configOptions;
+            break;
           case "tool_call": {
             const note = `tool: ${u.title ?? u.kind ?? u.toolCallId}`;
             this.turnLog.push(note);
@@ -424,6 +531,7 @@ export class AcpSession {
         this.conn = undefined;
         this.sessionId = undefined;
         this.starting = undefined;
+        this.configOptions = [];
         this.pushEvent({
           kind: "failed",
           error: new Error(`${this.member.name} exited unexpectedly (code=${code} signal=${signal})`),
@@ -453,6 +561,7 @@ export class AcpSession {
       // while newSession was in flight, don't bind a session to a dead child.
       if (this.child !== child) throw new Error(`${this.member.name} startup superseded`);
       this.sessionId = session.sessionId;
+      this.configOptions = session.configOptions ?? [];
     } catch (err) {
       const tail = this.stderr.join("").trim().slice(-600);
       // Don't leak the half-started subprocess; reset so the next call respawns.
@@ -634,6 +743,7 @@ export class AcpSession {
         this.finish(id);
         return { type: "answer", result };
       }
+      await this.selectModel(opts.model);
     } catch (err) {
       this.finish(id);
       throw err;
@@ -831,6 +941,7 @@ export class AcpSession {
     this.conn = undefined;
     this.sessionId = undefined;
     this.starting = undefined;
+    this.configOptions = [];
     if (child) hardKill(child);
   }
 
@@ -847,6 +958,7 @@ export class AcpSession {
         commands: this.config.allowCommands,
       },
       sessionStarted: this.sessionId !== undefined,
+      currentModel: this.modelInventory().currentModel,
       childAlive: child !== undefined && child.exitCode === null && !child.killed,
       pendingPermission: this.awaitingDecision?.description,
       stderrTail: this.stderr.join("").trim().slice(-600),

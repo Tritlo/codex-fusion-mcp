@@ -56,6 +56,7 @@ keeping one persistent session per member per workspace.
 | `permit` | allow/deny a permission a member raised mid-turn, then resume it (pass `member` if more than one is paused) |
 | `reset` | drop **all** members' accumulated context and start fresh sessions |
 | `status` | report the resolved host, the active council, and each active member's health |
+| `available_councilors` | start active members if needed and report ACP model selector values |
 
 All tools are **advisory** — the members answer, you decide. A member's direct
 tools (`ask_*`/`*_reply`) appear **only when that member isn't the host**; the
@@ -113,6 +114,46 @@ don't carry or leave cross-call context. It's slower (each advisor spawns fresh)
 forfeits the accumulated "collaborator" memory, so it's opt-in; the default reuses
 the persistent sessions. (`fresh` is the lightweight end of the council-memory
 trade-off; the durable other end is the proposed `MAGI.md`, ADR 0011.)
+
+### Model selection
+
+Call **`available_councilors`** to see the ACP model selector values reported by
+the active members. Use the value at the start of each model row, not the display
+label. For example, Claude may report values like:
+
+```text
+default
+opus[1m]
+claude-fable-5[1m]
+sonnet
+haiku
+```
+
+Then pass **`models`** to choose per-member models for a council fan-out:
+
+```json
+{
+  "members": ["claude"],
+  "models": { "claude": "opus[1m]" },
+  "question": "Review this risky design decision."
+}
+```
+
+Single-advisor tools take **`model`** instead:
+
+```json
+{
+  "model": "sonnet",
+  "question": "Give me a quick second opinion."
+}
+```
+
+Model selection is ACP session-level. On persistent sessions it remains until
+changed or `reset`; with `fresh`, it applies only to that throwaway session. If a
+member does not report a model selector, or you pass an unavailable value, the tool
+returns a readable member-specific error instead of guessing a fallback. Use Opus
+for high-leverage reviews; keep Fable/Sonnet/Haiku for routine checks so the
+council does not silently eat the expensive budget.
 
 It runs members **concurrently** and **atomically** — every advisor's turn fans out
 at once (each on its own session), rendered back in member order, as a single tool
@@ -291,6 +332,39 @@ host's MCP server env:
 That host then gets Claude + Grok as its council (`ask_claude`, `ask_grok`,
 `consult`). Check `status` to confirm the resolved host and active council.
 
+For Codex CLI/IDE specifically, either add it with the CLI:
+
+```bash
+codex mcp add magi-council \
+  --env MAGI_COUNCIL_EXCLUDE=codex \
+  --env MAGI_COUNCIL_WORKSPACE=/ABS/PATH/your-project \
+  -- /ABS/PATH/TO/bun run /ABS/PATH/magi-council-mcp/src/index.ts
+```
+
+Or put this in `~/.codex/config.toml` (or a trusted project `.codex/config.toml`):
+
+```toml
+[mcp_servers.magi-council]
+command = "/ABS/PATH/TO/bun"
+args = ["run", "/ABS/PATH/magi-council-mcp/src/index.ts"]
+startup_timeout_sec = 20
+tool_timeout_sec = 600
+
+[mcp_servers.magi-council.env]
+MAGI_COUNCIL_EXCLUDE = "codex"
+MAGI_COUNCIL_WORKSPACE = "/ABS/PATH/your-project"
+```
+
+Then restart Codex or start a new session and run `/mcp` to confirm the server is
+connected. Use `command -v bun` to find the Bun path; an absolute command avoids
+startup failures when Codex's MCP launcher does not inherit your interactive shell
+`PATH`.
+
+`MAGI_COUNCIL_WORKSPACE` is optional: if omitted, the server scopes members to the
+MCP process cwd. For a project-specific config you can instead set
+`cwd = "/ABS/PATH/your-project"` on `[mcp_servers.magi-council]` and omit the
+workspace env var.
+
 ## Configuration (env)
 
 | Variable | Default | Meaning |
@@ -326,7 +400,7 @@ src/config.ts       env → Config + 3 per-member MemberSpecs + host-exclude ove
 src/permissions.ts  guardianDecision — the pure permission policy
 src/council.ts      pure council-selection logic (selectCouncil)
 src/prompts.ts      host-parameterized prompts per tool (Codex/Grok/Claude, magi, generate)
-src/session.ts      AcpSession — ACP client: spawn a member, persistent session, streaming ask()
+src/session.ts      AcpSession — ACP client: spawn a member, model config, persistent session, streaming ask()
 src/reset.ts        per-workspace reset-nonce path (shared by server + hook)
 src/log.ts          per-turn debug log (stderr summary + optional JSONL file)
 src/index.ts        MCP server: 3 member sessions, host detection + tool gating, the Magi council

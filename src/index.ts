@@ -11,6 +11,7 @@ import {
   NoPendingPermission,
   type AskOptions,
   type AskResult,
+  type ModelInventory,
   type SessionStatus,
   type TurnOutcome,
 } from "./session.ts";
@@ -216,11 +217,11 @@ function streamHooks(notify: Notify, prefix = ""): Pick<AskOptions, "onText" | "
 }
 
 /** Start a member turn, streaming progress, honouring cancellation, and reporting errors. */
-function ask(id: MemberId, prompt: string, extra: Extra, label: string, time?: number): Promise<ToolResult> {
+function ask(id: MemberId, prompt: string, extra: Extra, label: string, time?: number, model?: string): Promise<ToolResult> {
   const session = sessions[id];
   const timeoutMs = time !== undefined ? time * 1000 : undefined;
   return session
-    .ask(prompt, { label, signal: extra.signal, timeoutMs, ...streamHooks(progressNotifier(extra)) })
+    .ask(prompt, { label, signal: extra.signal, timeoutMs, model, ...streamHooks(progressNotifier(extra)) })
     .then((outcome) => renderOutcome(outcome, session.name))
     .catch((err: unknown) => renderMemberError(session.name, err, session.loginHint));
 }
@@ -242,7 +243,25 @@ const timeField = {
     ),
 };
 
-const server = new McpServer({ name: "magi-council", version: "0.1.0" });
+type ModelSelection = Partial<Record<MemberId, string>>;
+const modelValue = z.string().min(1);
+const modelField = {
+  model: modelValue
+    .optional()
+    .describe(
+      "Optional ACP model selector value/name to use for this member before the turn starts. The selection is session-level and remains until changed or reset.",
+    ),
+};
+const modelsField = {
+  models: z
+    .object({ claude: modelValue.optional(), codex: modelValue.optional(), grok: modelValue.optional() })
+    .optional()
+    .describe(
+      "Optional per-member ACP model selector values/names for a council fan-out, e.g. { codex: \"...\", claude: \"...\" }. Values come from available_councilors.",
+    ),
+};
+
+const server = new McpServer({ name: "magi-council", version: "0.2.0" });
 
 // Tool handles per member, so the host's direct tools can be removed once known.
 const memberTools: Record<MemberId, Array<{ remove(): void }>> = { claude: [], codex: [], grok: [] };
@@ -261,12 +280,13 @@ memberTools.codex.push(
           .string()
           .optional()
           .describe("Optional background: your current thinking, constraints, or relevant snippets."),
+        ...modelField,
         ...timeField,
       },
     },
-    ({ question, context, time }, extra) =>
+    ({ question, context, time, model }, extra) =>
       isActive("codex")
-        ? ask("codex", askCodexPrompt(hostName(), question, context), extra, "ask_codex", time)
+        ? ask("codex", askCodexPrompt(hostName(), question, context), extra, "ask_codex", time, model)
         : inactiveResult("codex"),
   ),
 );
@@ -279,12 +299,13 @@ memberTools.codex.push(
         "Continue the conversation with Codex on the SAME session (it remembers the thread). Push back on its last answer and drive toward consensus — keep the whole debate to ~3 turns.",
       inputSchema: {
         message: z.string().describe("Your rebuttal, counter-point, or follow-up question for Codex."),
+        ...modelField,
         ...timeField,
       },
     },
-    ({ message, time }, extra) =>
+    ({ message, time, model }, extra) =>
       isActive("codex")
-        ? ask("codex", replyPrompt(hostName(), message), extra, "codex_reply", time)
+        ? ask("codex", replyPrompt(hostName(), message), extra, "codex_reply", time, model)
         : inactiveResult("codex"),
   ),
 );
@@ -300,12 +321,13 @@ memberTools.claude.push(
       inputSchema: {
         question: z.string().describe("The specific question or decision to put to Claude."),
         context: z.string().optional().describe("Optional background, constraints, or relevant snippets."),
+        ...modelField,
         ...timeField,
       },
     },
-    ({ question, context, time }, extra) =>
+    ({ question, context, time, model }, extra) =>
       isActive("claude")
-        ? ask("claude", askClaudePrompt(hostName(), question, context), extra, "ask_claude", time)
+        ? ask("claude", askClaudePrompt(hostName(), question, context), extra, "ask_claude", time, model)
         : inactiveResult("claude"),
   ),
 );
@@ -318,12 +340,13 @@ memberTools.claude.push(
         "Continue the conversation with Claude on the SAME session (it remembers the thread). Use to push back on or follow up Claude's last answer.",
       inputSchema: {
         message: z.string().describe("Your rebuttal, counter-point, or follow-up question for Claude."),
+        ...modelField,
         ...timeField,
       },
     },
-    ({ message, time }, extra) =>
+    ({ message, time, model }, extra) =>
       isActive("claude")
-        ? ask("claude", replyPrompt(hostName(), message), extra, "claude_reply", time)
+        ? ask("claude", replyPrompt(hostName(), message), extra, "claude_reply", time, model)
         : inactiveResult("claude"),
   ),
 );
@@ -339,12 +362,13 @@ memberTools.grok.push(
       inputSchema: {
         question: z.string().describe("The specific question or task to put to Grok."),
         context: z.string().optional().describe("Optional background, constraints, or relevant snippets."),
+        ...modelField,
         ...timeField,
       },
     },
-    ({ question, context, time }, extra) =>
+    ({ question, context, time, model }, extra) =>
       isActive("grok")
-        ? ask("grok", askGrokPrompt(hostName(), question, context), extra, "ask_grok", time)
+        ? ask("grok", askGrokPrompt(hostName(), question, context), extra, "ask_grok", time, model)
         : inactiveResult("grok"),
   ),
 );
@@ -357,11 +381,14 @@ memberTools.grok.push(
         "Continue the conversation with Grok on the SAME session (it remembers the thread). Use to push back on or follow up Grok's last answer.",
       inputSchema: {
         message: z.string().describe("Your rebuttal, counter-point, or follow-up question for Grok."),
+        ...modelField,
         ...timeField,
       },
     },
-    ({ message, time }, extra) =>
-      isActive("grok") ? ask("grok", replyPrompt(hostName(), message), extra, "grok_reply", time) : inactiveResult("grok"),
+    ({ message, time, model }, extra) =>
+      isActive("grok")
+        ? ask("grok", replyPrompt(hostName(), message), extra, "grok_reply", time, model)
+        : inactiveResult("grok"),
   ),
 );
 
@@ -381,12 +408,13 @@ memberTools.grok.push(
           .string()
           .optional()
           .describe("Optional path/filename to save to (relative to the workspace). Omit to let Grok choose."),
+        ...modelField,
         ...timeField,
       },
     },
-    ({ prompt, kind, output_path, time }, extra) =>
+    ({ prompt, kind, output_path, time, model }, extra) =>
       isActive("grok")
-        ? ask("grok", grokGeneratePrompt(prompt, kind ?? "image", output_path), extra, "grok_generate", time)
+        ? ask("grok", grokGeneratePrompt(prompt, kind ?? "image", output_path), extra, "grok_generate", time, model)
         : inactiveResult("grok"),
   ),
 );
@@ -414,15 +442,18 @@ server.registerTool(
       plan: z.string().describe("The plan/approach to review (steps, design, or intended changes)."),
       context: z.string().optional().describe("Optional background or constraints."),
       ...memberField,
+      ...modelField,
+      ...modelsField,
       ...timeField,
     },
   },
-  ({ plan, context, member, time }, extra) => {
+  ({ plan, context, member, time, model, models }, extra) => {
     const build = (id: MemberId): string => reviewPlanPrompt(specs[id].promptName, hostName(), plan, context);
-    if (member === "council") return councilFanOut("review_plan", build, extra, time !== undefined ? time * 1000 : undefined);
+    if (member === "council")
+      return councilFanOut("review_plan", build, extra, time !== undefined ? time * 1000 : undefined, persistentSession, activeIds(), undefined, models);
     const target = advisorFor(member);
     if (!target) return inactiveResult(member!);
-    return ask(target, build(target), extra, "review_plan", time);
+    return ask(target, build(target), extra, "review_plan", time, model);
   },
 );
 
@@ -436,10 +467,12 @@ server.registerTool(
       paths: z.string().optional().describe("Paths to focus on (used when no diff is supplied)."),
       instructions: z.string().optional().describe("Optional extra focus for the review."),
       ...memberField,
+      ...modelField,
+      ...modelsField,
       ...timeField,
     },
   },
-  ({ diff, paths, instructions, member, time }, extra) => {
+  ({ diff, paths, instructions, member, time, model, models }, extra) => {
     const build = (id: MemberId): string => reviewDiffPrompt(specs[id].promptName, hostName(), { diff, paths, instructions });
     if (member === "council") {
       // Council mode is read-only — it can't run `git diff`. Without an explicit
@@ -455,11 +488,11 @@ server.registerTool(
           ],
         };
       }
-      return councilFanOut("review_diff", build, extra, time !== undefined ? time * 1000 : undefined);
+      return councilFanOut("review_diff", build, extra, time !== undefined ? time * 1000 : undefined, persistentSession, activeIds(), undefined, models);
     }
     const target = advisorFor(member);
     if (!target) return inactiveResult(member!);
-    return ask(target, build(target), extra, "review_diff", time);
+    return ask(target, build(target), extra, "review_diff", time, model);
   },
 );
 
@@ -472,15 +505,18 @@ server.registerTool(
       problem: z.string().describe("The design problem to explore."),
       constraints: z.string().optional().describe("Optional constraints, requirements, or non-goals."),
       ...memberField,
+      ...modelField,
+      ...modelsField,
       ...timeField,
     },
   },
-  ({ problem, constraints, member, time }, extra) => {
+  ({ problem, constraints, member, time, model, models }, extra) => {
     const build = (id: MemberId): string => brainstormPrompt(specs[id].promptName, hostName(), problem, constraints);
-    if (member === "council") return councilFanOut("brainstorm", build, extra, time !== undefined ? time * 1000 : undefined);
+    if (member === "council")
+      return councilFanOut("brainstorm", build, extra, time !== undefined ? time * 1000 : undefined, persistentSession, activeIds(), undefined, models);
     const target = advisorFor(member);
     if (!target) return inactiveResult(member!);
-    return ask(target, build(target), extra, "brainstorm", time);
+    return ask(target, build(target), extra, "brainstorm", time, model);
   },
 );
 
@@ -493,15 +529,18 @@ server.registerTool(
       focus: z.string().optional().describe("What to focus the exploration on (a feature, subsystem, or question)."),
       paths: z.string().optional().describe("Optional starting paths."),
       ...memberField,
+      ...modelField,
+      ...modelsField,
       ...timeField,
     },
   },
-  ({ focus, paths, member, time }, extra) => {
+  ({ focus, paths, member, time, model, models }, extra) => {
     const build = (id: MemberId): string => explorePrompt(specs[id].promptName, hostName(), focus, paths);
-    if (member === "council") return councilFanOut("explore", build, extra, time !== undefined ? time * 1000 : undefined);
+    if (member === "council")
+      return councilFanOut("explore", build, extra, time !== undefined ? time * 1000 : undefined, persistentSession, activeIds(), undefined, models);
     const target = advisorFor(member);
     if (!target) return inactiveResult(member!);
-    return ask(target, build(target), extra, "explore", time);
+    return ask(target, build(target), extra, "explore", time, model);
   },
 );
 
@@ -533,6 +572,7 @@ server.registerTool(
         .describe(
           "Which members sit on the council for this call. Omit for the default — every active advisor (the members other than you). Name a subset to convene just those. (The host is never a member; it participates by driving the rounds.)",
         ),
+      ...modelsField,
       ...timeField,
     },
   },
@@ -545,6 +585,7 @@ interface MagiArgs {
   my_take?: string;
   fresh?: boolean;
   members?: MemberId[];
+  models?: ModelSelection;
   time?: number;
 }
 
@@ -579,6 +620,7 @@ async function councilTurn(
   extra: Extra,
   notify: Notify,
   timeoutMs: number | undefined,
+  model: string | undefined,
   getSession: SessionFor,
 ): Promise<{ name: string; markup: string; text: string }> {
   const name = specs[id].name;
@@ -587,6 +629,7 @@ async function councilTurn(
       label,
       signal: extra.signal,
       timeoutMs,
+      model,
       onAskPermission: "read-only",
       ...streamHooks(notify, prefix),
     });
@@ -625,6 +668,7 @@ async function councilFanOut(
   getSession: SessionFor = persistentSession,
   ids: MemberId[] = activeIds(),
   synth?: string,
+  models?: ModelSelection,
 ): Promise<ToolResult> {
   const host = hostName();
   const sections: string[] = [];
@@ -634,7 +678,7 @@ async function councilFanOut(
   const notify = progressNotifier(extra); // one shared channel for all concurrent advisors
   const voices = await Promise.all(
     ids.map((id) =>
-      councilTurn(id, buildPrompt(id), label, `${specs[id].name} `, extra, notify, timeoutMs, getSession),
+      councilTurn(id, buildPrompt(id), label, `${specs[id].name} `, extra, notify, timeoutMs, models?.[id], getSession),
     ),
   );
   sections.push(...voices.map((v) => v.markup));
@@ -692,6 +736,7 @@ async function runMagi(args: MagiArgs, extra: Extra): Promise<ToolResult> {
       getSession,
       active,
       `_You (${host}) are the lead **and a participant** in this deliberation. Read these views and form your own position. **Unless you and the council have reached agreement, call \`consult\` again** with \`my_take\` set to your current position (and any new framing in \`context\`) to run the next round — the advisors keep their context and will respond to you. Iterate until you judge agreement is reached, then act on it. (Or ask one directly with \`ask_codex\`/\`ask_grok\`/\`ask_claude\`.)_`,
+      args.models,
     );
   } finally {
     for (const s of Object.values(ephemeral)) s?.dispose();
@@ -699,6 +744,63 @@ async function runMagi(args: MagiArgs, extra: Extra): Promise<ToolResult> {
 }
 
 // --- Shared session controls ----------------------------------------------
+
+function renderModelInventory(id: MemberId, inventory: ModelInventory): string {
+  const lines = [`${specs[id].name}:`];
+  lines.push(`  session: ${inventory.sessionStarted ? "started" : "not started"}`);
+  lines.push(`  selector: ${inventory.selector ? `${inventory.selector.name} (${inventory.selector.id})` : "not reported"}`);
+  lines.push(`  current model: ${inventory.currentModel ?? "not reported"}`);
+  if (inventory.models.length === 0) {
+    lines.push("  models: not reported by ACP");
+  } else {
+    lines.push("  models:");
+    for (const model of inventory.models) {
+      const label = model.name === model.value ? model.value : `${model.value} (${model.name})`;
+      const group = model.group ? ` [${model.group}]` : "";
+      const current = model.current ? " (current)" : "";
+      lines.push(`    ${label}${group}${current}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+server.registerTool(
+  "available_councilors",
+  {
+    description:
+      "Start the requested active council members if needed and report the ACP model selector values they expose. Does not send a prompt/model turn; use the listed values with `consult.models` or single-member `model`.",
+    inputSchema: {
+      members: z
+        .array(z.enum(["claude", "codex", "grok"]))
+        .optional()
+        .describe("Optional active members to inspect. Omit for every active council member."),
+    },
+  },
+  async ({ members }, extra) => {
+    const ids = selectCouncil(members, activeIds());
+    if (ids.length === 0) {
+      return { content: [{ type: "text" as const, text: "No active council members in your selection." }] };
+    }
+    const sections = await Promise.all(
+      ids.map(async (id) => {
+        try {
+          return renderModelInventory(id, await sessions[id].availableModels(extra.signal));
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return `${specs[id].name}:\n  unavailable: ${msg}`;
+        }
+      }),
+    );
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `${sections.join("\n\n")}\n\nUse the value at the start of a model row, not the display name, when possible.`,
+        },
+      ],
+    };
+  },
+);
 
 server.registerTool(
   "permit",
@@ -819,6 +921,7 @@ function renderStatus(s: SessionStatus): string {
     `  acp command: ${s.acpCommand}`,
     `  guardian: external-reads ${onoff(s.guardian.externalReads)} · writes ${onoff(s.guardian.writes)} · commands ${onoff(s.guardian.commands)}`,
     `  session: ${s.sessionStarted ? "started" : "not started"} · subprocess: ${s.childAlive ? "alive" : "down"}`,
+    `  model: ${s.currentModel ?? "not reported"}`,
     `  ${s.pendingPermission ? `awaiting permit: ${s.pendingPermission}` : "no pending permission"}`,
     s.stderrTail ? `  recent stderr:\n${s.stderrTail}` : "  no stderr captured",
   ].join("\n");
